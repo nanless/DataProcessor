@@ -5,6 +5,7 @@
 使用Kimi-Audio模型对降噪前后的音频进行识别和WER计算
 使用webrtcvad进行VAD，基于语音段能量计算gain值
 支持多GPU并行处理
+通过HTTP API调用LLM服务进行文本标准化
 """
 
 import os
@@ -28,6 +29,13 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 import time
 import pickle
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# 设置代理绕过，确保可以访问本地LLM服务
+os.environ['no_proxy'] = 'localhost,127.0.0.1,::1'
+os.environ['NO_PROXY'] = 'localhost,127.0.0.1,::1'
 
 warnings.filterwarnings("ignore")
 
@@ -51,8 +59,18 @@ CONFIG = {
     'volume_matching_method': 'vad_energy',  # 音量匹配方法: 'vad_energy'
     'vad_aggressiveness': 3,  # VAD积极性等级 (0-3)
     'vad_frame_duration': 30,  # VAD帧长度（毫秒）
-    'num_gpus': 4,  # GPU数量
-    'gpu_ids': [0, 1, 2, 3],  # GPU ID列表
+    'num_gpus': 3,  # GPU数量（GPU 1,2,3用于ASR，GPU 0用于LLM服务）
+    'gpu_ids': [1, 2, 3],  # GPU ID列表
+    'text_normalization': 'llm',  # 文本标准化级别: 'basic', 'advanced', 'llm'
+    'remove_punctuation': True,  # 是否移除标点符号
+    'normalize_spacing': True,  # 是否标准化空格
+    'handle_spelling': True,  # 是否处理拼读问题
+    'spelling_max_length': 4,  # 拼读检测的最大长度
+    'preserve_common_words': True,  # 是否保留常见单词不拆分
+    'use_llm_normalization': True,  # 是否使用LLM进行文本标准化
+    'llm_service_url': 'http://localhost:8000',  # LLM服务URL
+    'llm_timeout': 30,  # LLM服务超时时间（秒）
+    'llm_max_retries': 3,  # LLM服务最大重试次数
 }
 
 class AudioVolumeProcessor:
@@ -194,6 +212,138 @@ class AudioVolumeProcessor:
         except Exception as e:
             logger.warning(f"应用gain失败: {e}")
             return audio, 1.0
+
+class HTTPTextNormalizer:
+    """基于HTTP API的文本标准化器"""
+    
+    def __init__(self, service_url: str, timeout: int = 30, max_retries: int = 3, gpu_id: int = 0):
+        self.service_url = service_url.rstrip('/')
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.gpu_id = gpu_id
+        
+        # 创建HTTP会话，配置重试策略和代理绕过
+        self.session = requests.Session()
+        
+        # 设置代理绕过
+        self.session.proxies = {
+            'http': None,
+            'https': None
+        }
+        
+        retry_strategy = Retry(
+            total=max_retries,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        # 设置请求头
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'User-Agent': f'AudioQualityAssessment/1.0 (GPU-{gpu_id})'
+        })
+        
+        logger.info(f"GPU {gpu_id}: 初始化HTTP文本标准化器")
+        logger.info(f"GPU {gpu_id}: 服务URL: {self.service_url}")
+        logger.info(f"GPU {gpu_id}: 超时时间: {self.timeout}s")
+        logger.info(f"GPU {gpu_id}: 最大重试: {self.max_retries}")
+        
+        # 测试连接
+        self._test_connection()
+    
+    def _test_connection(self):
+        """测试与LLM服务的连接"""
+        try:
+            health_url = f"{self.service_url}/health"
+            response = self.session.get(health_url, timeout=10)
+            response.raise_for_status()
+            
+            logger.info(f"GPU {self.gpu_id}: ✓ LLM服务连接正常")
+            
+            # 获取模型信息
+            try:
+                model_info_url = f"{self.service_url}/model_info"
+                response = self.session.get(model_info_url, timeout=10)
+                response.raise_for_status()
+                info = response.json()
+                logger.info(f"GPU {self.gpu_id}: LLM模型信息: {info}")
+            except Exception as e:
+                logger.warning(f"GPU {self.gpu_id}: 无法获取模型信息: {e}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"GPU {self.gpu_id}: LLM服务连接失败: {e}")
+            raise
+    
+    def normalize_text_pair(self, text1: str, text2: str) -> Tuple[str, str]:
+        """使用HTTP API标准化文本对"""
+        try:
+            # 准备请求数据
+            request_data = {
+                "text1": text1,
+                "text2": text2
+            }
+            
+            # 发送请求
+            normalize_url = f"{self.service_url}/normalize"
+            response = self.session.post(
+                normalize_url,
+                json=request_data,
+                timeout=self.timeout
+            )
+            
+            # 检查响应
+            response.raise_for_status()
+            result = response.json()
+            
+            # 提取结果
+            normalized_text1 = result.get("normalized_text1", "")
+            normalized_text2 = result.get("normalized_text2", "")
+            success = result.get("success", False)
+            error_message = result.get("error_message")
+            
+            if not success and error_message:
+                logger.warning(f"GPU {self.gpu_id}: LLM标准化失败: {error_message}")
+            
+            logger.info(f"GPU {self.gpu_id}: HTTP LLM标准化完成")
+            logger.info(f"GPU {self.gpu_id}: 原始文本1: '{text1}' -> 标准化: '{normalized_text1}'")
+            logger.info(f"GPU {self.gpu_id}: 原始文本2: '{text2}' -> 标准化: '{normalized_text2}'")
+            
+            return normalized_text1, normalized_text2
+            
+        except requests.exceptions.Timeout:
+            logger.error(f"GPU {self.gpu_id}: LLM服务请求超时")
+            return self.basic_normalize(text1), self.basic_normalize(text2)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"GPU {self.gpu_id}: LLM服务请求失败: {e}")
+            return self.basic_normalize(text1), self.basic_normalize(text2)
+        except Exception as e:
+            logger.error(f"GPU {self.gpu_id}: HTTP LLM标准化失败: {e}")
+            return self.basic_normalize(text1), self.basic_normalize(text2)
+    
+    def basic_normalize(self, text: str) -> str:
+        """基础文本标准化（降级方法）"""
+        import re
+        import string
+        
+        if not text:
+            return ""
+        
+        # 转换为小写
+        text = text.lower().strip()
+        
+        # 移除标点符号
+        punctuation = string.punctuation + '，。！？；：""''（）【】《》〈〉「」『』〖〗〔〕［］｛｝'
+        for p in punctuation:
+            text = text.replace(p, '')
+        
+        # 标准化空格
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
 
 class KimiAudioProcessor:
     """Kimi-Audio处理器"""
@@ -350,6 +500,21 @@ class QualityAssessmentProcessor:
             gpu_id=gpu_id
         )
         
+        # 初始化HTTP文本标准化器（如果启用）
+        self.http_normalizer = None
+        if config.get('use_llm_normalization', False) and config.get('text_normalization') == 'llm':
+            try:
+                self.http_normalizer = HTTPTextNormalizer(
+                    service_url=config['llm_service_url'],
+                    timeout=config['llm_timeout'],
+                    max_retries=config['llm_max_retries'],
+                    gpu_id=gpu_id
+                )
+            except Exception as e:
+                logger.warning(f"GPU {gpu_id}: 初始化HTTP文本标准化器失败: {e}")
+                logger.warning(f"GPU {gpu_id}: 将使用传统标准化方法")
+                self.http_normalizer = None
+        
         # 统计信息
         self.stats = {
             'total_pairs': 0,
@@ -403,15 +568,158 @@ class QualityAssessmentProcessor:
             logger.error(f"保存音频失败 {output_path}: {e}")
             return False
     
+    def get_common_words(self) -> set:
+        """获取常见英文单词集合"""
+        # 常见的英文单词列表（可以根据需要扩展）
+        common_words = {
+            'the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have', 'i', 'it', 'for', 'not', 'on', 'with',
+            'he', 'as', 'you', 'do', 'at', 'this', 'but', 'his', 'by', 'from', 'they', 'she', 'or', 'an', 'will',
+            'my', 'one', 'all', 'would', 'there', 'their', 'what', 'so', 'up', 'out', 'if', 'about', 'who', 'get',
+            'which', 'go', 'me', 'when', 'make', 'can', 'like', 'time', 'no', 'just', 'him', 'know', 'take',
+            'people', 'into', 'year', 'your', 'good', 'some', 'could', 'them', 'see', 'other', 'than', 'then',
+            'now', 'look', 'only', 'come', 'its', 'over', 'think', 'also', 'back', 'after', 'use', 'two', 'how',
+            'our', 'work', 'first', 'well', 'way', 'even', 'new', 'want', 'because', 'any', 'these', 'give', 'day',
+            'most', 'us', 'is', 'was', 'are', 'been', 'has', 'had', 'were', 'said', 'each', 'which', 'their',
+            'said', 'she', 'use', 'how', 'many', 'oil', 'sit', 'set', 'run', 'eat', 'far', 'sea', 'eye', 'ago',
+            'off', 'far', 'set', 'own', 'under', 'last', 'right', 'move', 'thing', 'general', 'school', 'never',
+            'same', 'another', 'begin', 'while', 'number', 'part', 'turn', 'real', 'leave', 'might', 'great',
+            'little', 'world', 'public', 'read', 'such', 'where', 'much', 'family', 'long', 'both', 'leave',
+            'put', 'end', 'why', 'let', 'home', 'big', 'find', 'came', 'every', 'side', 'tried', 'told', 'men',
+            'women', 'child', 'children', 'got', 'life', 'called', 'need', 'may', 'ask', 'went', 'say', 'kind',
+            'must', 'house', 'picture', 'try', 'again', 'change', 'play', 'small', 'spell', 'move', 'live',
+            'place', 'sound', 'great', 'again', 'still', 'every', 'large', 'must', 'big', 'even', 'such', 'because',
+            'turn', 'here', 'why', 'ask', 'went', 'men', 'read', 'need', 'land', 'different', 'home', 'move',
+            'try', 'kind', 'hand', 'picture', 'again', 'change', 'off', 'play', 'spell', 'air', 'away', 'animal',
+            'house', 'point', 'page', 'letter', 'mother', 'answer', 'found', 'study', 'still', 'learn', 'should',
+            'america', 'world', 'high', 'every', 'near', 'add', 'food', 'between', 'own', 'below', 'country',
+            'plant', 'last', 'school', 'father', 'keep', 'tree', 'never', 'start', 'city', 'earth', 'eye', 'light',
+            'thought', 'head', 'under', 'story', 'saw', 'left', 'dont', 'few', 'while', 'along', 'might', 'close',
+            'something', 'seem', 'next', 'hard', 'open', 'example', 'begin', 'life', 'always', 'those', 'both',
+            'paper', 'together', 'got', 'group', 'often', 'run', 'important', 'until', 'children', 'side', 'feet',
+            'car', 'mile', 'night', 'walk', 'white', 'sea', 'began', 'grow', 'took', 'river', 'four', 'carry',
+            'state', 'once', 'book', 'hear', 'stop', 'without', 'second', 'later', 'miss', 'idea', 'enough', 'eat',
+            'face', 'watch', 'far', 'indian', 'really', 'almost', 'let', 'above', 'girl', 'sometimes', 'mountain',
+            'cut', 'young', 'talk', 'soon', 'list', 'song', 'being', 'leave', 'family', 'its'
+        }
+        return common_words
+    
+    def normalize_text(self, text: str) -> str:
+        """文本标准化，处理标点、空格、连词等问题"""
+        import re
+        import string
+        
+        if not text:
+            return ""
+        
+        # 根据配置选择标准化级别
+        normalization_level = self.config.get('text_normalization', 'advanced')
+        
+        if normalization_level == 'basic':
+            # 基础标准化：处理大小写、标点符号和多余空格
+            text = text.lower().strip()
+            
+            # 移除标点符号（如果启用）
+            if self.config.get('remove_punctuation', True):
+                # 包括中文标点符号
+                punctuation = string.punctuation + '，。！？；：""''（）【】《》〈〉「」『』〖〗〔〕［］｛｝'
+                for p in punctuation:
+                    text = text.replace(p, '')
+                
+                # 处理特殊字符和符号
+                text = re.sub(r'[^\w\s]', '', text)
+            
+            # 标准化空格
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text
+        
+        # 转换为小写
+        text = text.lower().strip()
+        
+        # 移除标点符号（如果启用）
+        if self.config.get('remove_punctuation', True):
+            # 包括中文标点符号
+            punctuation = string.punctuation + '，。！？；：""''（）【】《》〈〉「」『』〖〗〔〕［］｛｝'
+            for p in punctuation:
+                text = text.replace(p, '')
+            
+            # 处理特殊字符和符号
+            text = re.sub(r'[^\w\s]', '', text)
+        
+        # 统一空格处理（如果启用）
+        if self.config.get('normalize_spacing', True):
+            # 将多个空格替换为单个空格
+            text = re.sub(r'\s+', ' ', text)
+        
+        # 处理拼读问题（如果启用）
+        if self.config.get('handle_spelling', True) and normalization_level == 'advanced':
+            text = self._handle_spelling_normalization(text)
+        
+        # 最终清理空格
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+    
+    def _handle_spelling_normalization(self, text: str) -> str:
+        """处理拼读标准化"""
+        import re
+        
+        # 获取常见单词集合
+        common_words = self.get_common_words() if self.config.get('preserve_common_words', True) else set()
+        max_length = self.config.get('spelling_max_length', 4)
+        
+        # 先处理明显的拼读模式（单个字符用空格分隔）
+        # 匹配单个字符后跟空格的模式，这通常是拼读
+        if re.search(r'\b[a-z]\s+[a-z]\b', text):
+            # 这看起来已经是拼读模式，保持原样
+            return text
+        
+        # 尝试识别可能的拼读模式
+        words = text.split()
+        processed_words = []
+        
+        for word in words:
+            # 如果单词长度>1且全是字母或数字，可能需要拆分
+            if len(word) > 1 and (word.isalpha() or word.isdigit()):
+                should_split = False
+                
+                if word.isdigit():
+                    # 数字序列，如果长度在合理范围内就拆分
+                    if len(word) <= max_length:
+                        should_split = True
+                elif word.isalpha():
+                    # 字母序列
+                    if word.lower() in common_words:
+                        # 是常见单词，不拆分
+                        should_split = False
+                    elif len(word) <= max_length:
+                        # 短字母序列，可能是拼读
+                        # 额外检查：如果包含元音且长度>2，可能是正常单词
+                        if len(word) > 2 and any(vowel in word for vowel in 'aeiou'):
+                            # 进一步检查是否符合英文单词的常见模式
+                            # 简单规则：如果元音和辅音交替出现，可能是正常单词
+                            vowels = 'aeiou'
+                            vowel_pattern = sum(1 for c in word if c in vowels)
+                            if vowel_pattern >= len(word) // 3:  # 至少1/3是元音
+                                should_split = False
+                            else:
+                                should_split = True
+                        else:
+                            should_split = True
+                
+                if should_split:
+                    processed_words.append(' '.join(word))
+                else:
+                    processed_words.append(word)
+            else:
+                processed_words.append(word)
+        
+        return ' '.join(processed_words)
+    
     def calculate_wer_cer(self, reference: str, hypothesis: str) -> Tuple[float, float]:
-        """计算WER和CER"""
+        """计算WER和CER（文本应该已经标准化）"""
         try:
             if not reference or not hypothesis:
                 return 1.0, 1.0  # 如果有空文本，返回最大错误率
-            
-            # 文本预处理
-            reference = reference.strip().lower()
-            hypothesis = hypothesis.strip().lower()
             
             # 计算WER
             word_error_rate = wer(reference, hypothesis)
@@ -422,27 +730,42 @@ class QualityAssessmentProcessor:
             return word_error_rate, char_error_rate
             
         except Exception as e:
-            logger.error(f"计算WER/CER失败: {e}")
+            logger.error(f"GPU {self.gpu_id}: 计算WER/CER失败: {e}")
             return 1.0, 1.0
     
     def process_audio_pair(self, original_path: str, enhanced_path: str, 
-                          output_dir: str) -> Dict:
+                          output_dir: str, base_original_dir: str) -> Dict:
         """处理单个音频对"""
         
         result = {
             'original_path': original_path,
             'enhanced_path': enhanced_path,
             'processed_enhanced_path': '',
+            'relative_path': '',  # 相对路径
             'original_transcription': '',
             'enhanced_transcription': '',
+            'original_transcription_normalized': '',  # TN后的原始文本
+            'enhanced_transcription_normalized': '',  # TN后的增强文本
             'wer': 0.0,
             'cer': 0.0,
+            'is_usable': False,  # CER<5%的音频才可用
             'volume_scale_factor': 1.0,
             'volume_matching_method': self.config['volume_matching_method'],
             'processing_time': 0.0,
             'success': False,
             'error_message': '',
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'text_normalization_config': {
+                'level': self.config.get('text_normalization', 'llm'),
+                'remove_punctuation': self.config.get('remove_punctuation', True),
+                'normalize_spacing': self.config.get('normalize_spacing', True),
+                'handle_spelling': self.config.get('handle_spelling', True),
+                'spelling_max_length': self.config.get('spelling_max_length', 4),
+                'preserve_common_words': self.config.get('preserve_common_words', True),
+                'use_llm_normalization': self.config.get('use_llm_normalization', False),
+                'llm_service_url': self.config.get('llm_service_url', ''),
+                'llm_enabled': self.http_normalizer is not None
+            }
         }
         
         try:
@@ -454,6 +777,15 @@ class QualityAssessmentProcessor:
                 raise FileNotFoundError(f"原始音频文件不存在: {original_path}")
             if not os.path.exists(enhanced_path):
                 raise FileNotFoundError(f"增强音频文件不存在: {enhanced_path}")
+            
+            # 计算相对路径，用于保持目录结构
+            relative_path = os.path.relpath(original_path, base_original_dir)
+            result['relative_path'] = relative_path
+            
+            # 创建对应的输出目录结构
+            relative_dir = os.path.dirname(relative_path)
+            structured_output_dir = os.path.join(output_dir, relative_dir) if relative_dir else output_dir
+            os.makedirs(structured_output_dir, exist_ok=True)
             
             # 预处理音频
             logger.info(f"GPU {self.gpu_id}: 预处理音频: {original_path}")
@@ -472,15 +804,16 @@ class QualityAssessmentProcessor:
                 matched_audio = enhanced_audio
                 result['volume_scale_factor'] = 1.0
             
-            # 保存处理后的音频
-            matched_filename = f"{Path(enhanced_path).stem}_gain_applied.wav"
-            matched_path = os.path.join(output_dir, matched_filename)
+            # 保存处理后的音频（按原始目录结构）
+            audio_basename = os.path.splitext(os.path.basename(relative_path))[0]
+            matched_filename = f"{audio_basename}_gain_applied.wav"
+            matched_path = os.path.join(structured_output_dir, matched_filename)
             
             if self.save_processed_audio(matched_audio, matched_path, sr):
                 result['processed_enhanced_path'] = matched_path
             
             # 创建临时文件进行识别
-            temp_original = os.path.join(output_dir, f"temp_original_{Path(original_path).stem}.wav")
+            temp_original = os.path.join(structured_output_dir, f"temp_original_{audio_basename}.wav")
             temp_enhanced = matched_path
             
             # 保存原始音频（重采样后）
@@ -503,15 +836,46 @@ class QualityAssessmentProcessor:
                 
                 # 计算WER和CER
                 if original_transcription and enhanced_transcription:
-                    wer_score, cer_score = self.calculate_wer_cer(
-                        original_transcription, enhanced_transcription
-                    )
-                    result['wer'] = wer_score
-                    result['cer'] = cer_score
+                    # 先保存TN前的文本
+                    result['original_transcription_normalized'] = original_transcription
+                    result['enhanced_transcription_normalized'] = enhanced_transcription
                     
-                    logger.info(f"GPU {self.gpu_id}: WER: {wer_score:.4f}, CER: {cer_score:.4f}")
+                    # 进行文本标准化
+                    if self.http_normalizer is not None and self.config.get('text_normalization') == 'llm':
+                        # 使用HTTP LLM标准化
+                        logger.info(f"GPU {self.gpu_id}: 使用HTTP LLM进行文本标准化")
+                        normalized_original, normalized_enhanced = self.http_normalizer.normalize_text_pair(
+                            original_transcription, enhanced_transcription
+                        )
+                        result['original_transcription_normalized'] = normalized_original
+                        result['enhanced_transcription_normalized'] = normalized_enhanced
+                    else:
+                        # 使用传统标准化
+                        normalized_original = self.normalize_text(original_transcription)
+                        normalized_enhanced = self.normalize_text(enhanced_transcription)
+                        result['original_transcription_normalized'] = normalized_original
+                        result['enhanced_transcription_normalized'] = normalized_enhanced
+                    
+                    # 计算WER和CER（使用标准化后的文本）
+                    if normalized_original and normalized_enhanced:
+                        wer_score = wer(normalized_original, normalized_enhanced)
+                        cer_score = cer(normalized_original, normalized_enhanced)
+                        result['wer'] = wer_score
+                        result['cer'] = cer_score
+                        
+                        # 判断音频是否可用（CER < 5%）
+                        result['is_usable'] = cer_score < 0.05
+                        
+                        logger.info(f"GPU {self.gpu_id}: WER: {wer_score:.4f}, CER: {cer_score:.4f}, 可用: {result['is_usable']}")
+                    else:
+                        logger.warning(f"GPU {self.gpu_id}: 标准化后文本为空，无法计算WER/CER")
+                        result['is_usable'] = False
                 else:
                     logger.warning(f"GPU {self.gpu_id}: 转录结果为空，无法计算WER/CER")
+                    result['is_usable'] = False
+                
+                # 保存文本结果（按原始目录结构）
+                self.save_text_results(result, structured_output_dir, audio_basename)
                 
                 # 清理临时文件
                 try:
@@ -547,9 +911,12 @@ class QualityAssessmentProcessor:
             
             # 检查是否跳过已存在的结果
             if self.config['skip_existing']:
+                # 计算相对路径和基础文件名
+                relative_path = os.path.relpath(original_path, self.config['original_dir'])
+                audio_basename = os.path.splitext(os.path.basename(relative_path))[0]
                 result_file = os.path.join(
                     subset_output_dir,
-                    f"{Path(enhanced_path).stem}_assessment.json"
+                    f"{audio_basename}_assessment.json"
                 )
                 if os.path.exists(result_file):
                     try:
@@ -563,14 +930,15 @@ class QualityAssessmentProcessor:
             
             # 处理音频对
             result = self.process_audio_pair(
-                original_path, enhanced_path, subset_output_dir
+                original_path, enhanced_path, subset_output_dir, self.config['original_dir']
             )
             results.append(result)
             
-            # 保存单个结果
+            # 保存单个结果到子集目录
+            audio_basename = os.path.splitext(os.path.basename(result.get('relative_path', enhanced_path)))[0]
             result_file = os.path.join(
                 subset_output_dir,
-                f"{Path(enhanced_path).stem}_assessment.json"
+                f"{audio_basename}_assessment.json"
             )
             with open(result_file, 'w', encoding='utf-8') as f:
                 json.dump(result, f, indent=2, ensure_ascii=False)
@@ -611,6 +979,12 @@ class QualityAssessmentProcessor:
         
         return audio_pairs
     
+    def save_text_results(self, result: Dict, output_dir: str, audio_basename: str):
+        """保存文本结果到JSON文件"""
+        text_result_file = os.path.join(output_dir, f"{audio_basename}_text_results.json")
+        with open(text_result_file, 'w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        logger.info(f"GPU {self.gpu_id}: 文本结果已保存到: {text_result_file}")
 
 
 def split_audio_pairs(audio_pairs: List[Tuple[str, str]], num_splits: int) -> List[List[Tuple[str, str]]]:
@@ -693,14 +1067,22 @@ def merge_results(output_dir: str, num_gpus: int, config: Dict):
     
     # 保存统计摘要
     successful_results = [r for r in all_results if r['success']]
+    usable_results = [r for r in successful_results if r.get('is_usable', False)]
+    
     if successful_results:
         wer_scores = [r['wer'] for r in successful_results]
         cer_scores = [r['cer'] for r in successful_results]
+        
+        # 可用音频的统计
+        usable_wer_scores = [r['wer'] for r in usable_results]
+        usable_cer_scores = [r['cer'] for r in usable_results]
         
         summary = {
             'total_pairs': len(all_results),
             'successful_pairs': len(successful_results),
             'failed_pairs': len(all_results) - len(successful_results),
+            'usable_pairs': len(usable_results),
+            'usable_rate': len(usable_results) / len(successful_results) if successful_results else 0.0,
             'average_wer': float(np.mean(wer_scores)) if wer_scores else 0.0,
             'average_cer': float(np.mean(cer_scores)) if cer_scores else 0.0,
             'median_wer': float(np.median(wer_scores)) if wer_scores else 0.0,
@@ -711,6 +1093,11 @@ def merge_results(output_dir: str, num_gpus: int, config: Dict):
             'max_wer': float(np.max(wer_scores)) if wer_scores else 0.0,
             'min_cer': float(np.min(cer_scores)) if cer_scores else 0.0,
             'max_cer': float(np.max(cer_scores)) if cer_scores else 0.0,
+            # 可用音频统计
+            'usable_average_wer': float(np.mean(usable_wer_scores)) if usable_wer_scores else 0.0,
+            'usable_average_cer': float(np.mean(usable_cer_scores)) if usable_cer_scores else 0.0,
+            'usable_median_wer': float(np.median(usable_wer_scores)) if usable_wer_scores else 0.0,
+            'usable_median_cer': float(np.median(usable_cer_scores)) if usable_cer_scores else 0.0,
             'config': config,
             'timestamp': datetime.now().isoformat()
         }
@@ -719,8 +1106,22 @@ def merge_results(output_dir: str, num_gpus: int, config: Dict):
             'total_pairs': len(all_results),
             'successful_pairs': 0,
             'failed_pairs': len(all_results),
+            'usable_pairs': 0,
+            'usable_rate': 0.0,
             'average_wer': 0.0,
             'average_cer': 0.0,
+            'median_wer': 0.0,
+            'median_cer': 0.0,
+            'wer_std': 0.0,
+            'cer_std': 0.0,
+            'min_wer': 0.0,
+            'max_wer': 0.0,
+            'min_cer': 0.0,
+            'max_cer': 0.0,
+            'usable_average_wer': 0.0,
+            'usable_average_cer': 0.0,
+            'usable_median_wer': 0.0,
+            'usable_median_cer': 0.0,
             'config': config,
             'timestamp': datetime.now().isoformat()
         }
@@ -746,6 +1147,7 @@ def merge_results(output_dir: str, num_gpus: int, config: Dict):
 def print_summary(results: List[Dict]):
     """打印统计摘要"""
     successful_results = [r for r in results if r['success']]
+    usable_results = [r for r in successful_results if r.get('is_usable', False)]
     
     print("\n" + "=" * 80)
     print("音频质量评估结果摘要 (多GPU并行)")
@@ -753,10 +1155,14 @@ def print_summary(results: List[Dict]):
     print(f"总音频对数:     {len(results)}")
     print(f"成功处理:       {len(successful_results)}")
     print(f"失败处理:       {len(results) - len(successful_results)}")
+    print(f"可用音频数:     {len(usable_results)} (CER<5%)")
+    print(f"可用率:         {len(usable_results)/len(successful_results)*100:.1f}%" if successful_results else "0.0%")
     
     if successful_results:
         wer_scores = [r['wer'] for r in successful_results]
         cer_scores = [r['cer'] for r in successful_results]
+        usable_wer_scores = [r['wer'] for r in usable_results]
+        usable_cer_scores = [r['cer'] for r in usable_results]
         
         print(f"\n词错误率 (WER):")
         print(f"  平均值:       {np.mean(wer_scores):.4f}")
@@ -772,6 +1178,14 @@ def print_summary(results: List[Dict]):
         print(f"  最小值:       {np.min(cer_scores):.4f}")
         print(f"  最大值:       {np.max(cer_scores):.4f}")
         
+        # 可用音频统计
+        if usable_results:
+            print(f"\n可用音频质量 (CER<5%):")
+            print(f"  WER平均值:    {np.mean(usable_wer_scores):.4f}")
+            print(f"  WER中位数:    {np.median(usable_wer_scores):.4f}")
+            print(f"  CER平均值:    {np.mean(usable_cer_scores):.4f}")
+            print(f"  CER中位数:    {np.median(usable_cer_scores):.4f}")
+        
         # WER分布
         print(f"\nWER分布:")
         excellent = sum(1 for w in wer_scores if w < 0.1)
@@ -783,6 +1197,16 @@ def print_summary(results: List[Dict]):
         print(f"  良好 (0.1 ≤ WER < 0.2): {good} ({good/len(wer_scores)*100:.1f}%)")
         print(f"  一般 (0.2 ≤ WER < 0.3): {fair} ({fair/len(wer_scores)*100:.1f}%)")
         print(f"  较差 (WER ≥ 0.3):   {poor} ({poor/len(wer_scores)*100:.1f}%)")
+        
+        # CER分布
+        print(f"\nCER分布 (可用性判断):")
+        usable_cer = sum(1 for c in cer_scores if c < 0.05)
+        marginal_cer = sum(1 for c in cer_scores if 0.05 <= c < 0.10)
+        poor_cer = sum(1 for c in cer_scores if c >= 0.10)
+        
+        print(f"  可用 (CER < 5%):    {usable_cer} ({usable_cer/len(cer_scores)*100:.1f}%)")
+        print(f"  边际 (5% ≤ CER < 10%): {marginal_cer} ({marginal_cer/len(cer_scores)*100:.1f}%)")
+        print(f"  不可用 (CER ≥ 10%): {poor_cer} ({poor_cer/len(cer_scores)*100:.1f}%)")
         
         # 增益应用方法统计
         volume_methods = [r['volume_matching_method'] for r in successful_results]
@@ -864,10 +1288,41 @@ def main():
                        help="VAD积极性等级 (0-3)")
     parser.add_argument("--num_gpus", type=int,
                        default=CONFIG['num_gpus'],
-                       help="GPU数量")
+                       help="GPU数量（GPU 1,2,3用于ASR，GPU 0用于LLM服务）")
     parser.add_argument("--gpu_ids", type=int, nargs='+',
                        default=CONFIG['gpu_ids'],
-                       help="GPU ID列表")
+                       help="GPU ID列表（建议使用 1,2,3，GPU 0留给LLM服务）")
+    parser.add_argument("--text_normalization", type=str,
+                       default=CONFIG['text_normalization'],
+                       choices=['basic', 'advanced', 'llm'],
+                       help="文本标准化级别")
+    parser.add_argument("--remove_punctuation", action="store_true",
+                       default=CONFIG['remove_punctuation'],
+                       help="移除标点符号")
+    parser.add_argument("--normalize_spacing", action="store_true",
+                       default=CONFIG['normalize_spacing'],
+                       help="标准化空格")
+    parser.add_argument("--handle_spelling", action="store_true",
+                       default=CONFIG['handle_spelling'],
+                       help="处理拼读问题")
+    parser.add_argument("--spelling_max_length", type=int,
+                       default=CONFIG['spelling_max_length'],
+                       help="拼读检测的最大长度")
+    parser.add_argument("--preserve_common_words", action="store_true",
+                       default=CONFIG['preserve_common_words'],
+                       help="保留常见单词不拆分")
+    parser.add_argument("--llm_service_url", type=str,
+                       default=CONFIG['llm_service_url'],
+                       help="LLM服务URL")
+    parser.add_argument("--llm_timeout", type=int,
+                       default=CONFIG['llm_timeout'],
+                       help="LLM服务超时时间（秒）")
+    parser.add_argument("--llm_max_retries", type=int,
+                       default=CONFIG['llm_max_retries'],
+                       help="LLM服务最大重试次数")
+    parser.add_argument("--use_llm_normalization", action="store_true",
+                       default=CONFIG['use_llm_normalization'],
+                       help="使用LLM进行文本标准化")
     
     args = parser.parse_args()
     
@@ -876,22 +1331,39 @@ def main():
     
     # 确保GPU数量和ID列表一致
     if len(CONFIG['gpu_ids']) != CONFIG['num_gpus']:
-        CONFIG['gpu_ids'] = list(range(CONFIG['num_gpus']))
+        CONFIG['gpu_ids'] = list(range(1, CONFIG['num_gpus'] + 1))  # 默认使用GPU 1,2,3...
     
-    print("音频质量评估脚本 (多GPU并行版本 - 已修复CUDA兼容性)")
+    print("音频质量评估脚本 (多GPU并行版本 - qwen2.5:7b)")
     print("=" * 70)
     print(f"原始音频目录: {CONFIG['original_dir']}")
     print(f"增强音频目录: {CONFIG['enhanced_dir']}")
     print(f"输出目录: {CONFIG['output_dir']}")
     print(f"Kimi-Audio模型: {CONFIG['kimi_model_path']}")
     print(f"Kimi-Audio目录: {CONFIG['kimi_audio_dir']}")
-    print(f"GPU数量: {CONFIG['num_gpus']}")
-    print(f"GPU ID列表: {CONFIG['gpu_ids']}")
+    print(f"GPU配置: GPU 0 (LLM服务 - qwen2.5:7b), GPU {CONFIG['gpu_ids']} (ASR)")
+    print(f"ASR GPU数量: {CONFIG['num_gpus']}")
+    print(f"ASR GPU ID列表: {CONFIG['gpu_ids']}")
     print(f"音量匹配方法: {CONFIG['volume_matching_method']}")
     print(f"VAD积极性等级: {CONFIG['vad_aggressiveness']}")
     print(f"跳过已存在: {CONFIG['skip_existing']}")
     print(f"最大音频长度: {CONFIG['max_audio_length']} 秒")
+    print(f"文本标准化级别: {CONFIG['text_normalization']}")
+    if CONFIG['text_normalization'] == 'llm':
+        print(f"LLM服务URL: {CONFIG['llm_service_url']}")
+        print(f"LLM模型: qwen2.5:7b (GPU 0)")
+        print(f"LLM超时时间: {CONFIG['llm_timeout']} 秒")
+        print(f"LLM最大重试: {CONFIG['llm_max_retries']}")
+        print(f"使用LLM标准化: {CONFIG['use_llm_normalization']}")
+    else:
+        print(f"移除标点符号: {CONFIG['remove_punctuation']}")
+        print(f"标准化空格: {CONFIG['normalize_spacing']}")
+        print(f"处理拼读问题: {CONFIG['handle_spelling']}")
+        if CONFIG['handle_spelling']:
+            print(f"拼读检测最大长度: {CONFIG['spelling_max_length']}")
+            print(f"保留常见单词: {CONFIG['preserve_common_words']}")
     print("已启用: spawn多进程模式 (CUDA兼容)")
+    print("已启用: 代理绕过 (避免网络拦截)")
+    print("通过HTTP API调用LLM服务")
     print("=" * 70)
     
     # 检查输入目录
@@ -923,9 +1395,43 @@ def main():
         return
     
     available_gpus = torch.cuda.device_count()
-    if available_gpus < CONFIG['num_gpus']:
-        logger.error(f"可用GPU数量({available_gpus})小于所需数量({CONFIG['num_gpus']})")
+    max_required_gpu = max(CONFIG['gpu_ids']) if CONFIG['gpu_ids'] else 0
+    if available_gpus <= max_required_gpu:
+        logger.error(f"可用GPU数量({available_gpus})不足，需要GPU {max_required_gpu}")
         return
+    
+    print(f"✓ 检测到{available_gpus}个GPU，将使用GPU {CONFIG['gpu_ids']}进行ASR")
+    
+    # 检查LLM服务连接（如果启用）
+    if CONFIG.get('use_llm_normalization', False) and CONFIG.get('text_normalization') == 'llm':
+        try:
+            import requests
+            # 设置代理绕过
+            session = requests.Session()
+            session.proxies = {'http': None, 'https': None}
+            
+            health_url = f"{CONFIG['llm_service_url']}/health"
+            response = session.get(health_url, timeout=10)
+            response.raise_for_status()
+            print(f"✓ LLM服务连接正常: {CONFIG['llm_service_url']}")
+            
+            # 获取模型信息
+            try:
+                model_info_url = f"{CONFIG['llm_service_url']}/model_info"
+                response = session.get(model_info_url, timeout=10)
+                response.raise_for_status()
+                info = response.json()
+                print(f"✓ LLM模型信息: {info.get('model_name', 'unknown')}")
+            except Exception as e:
+                logger.warning(f"无法获取LLM模型信息: {e}")
+                
+        except Exception as e:
+            logger.error(f"LLM服务连接失败: {e}")
+            logger.error("请确保LLM服务已启动在GPU 0上")
+            logger.error("启动命令:")
+            logger.error("1. CUDA_VISIBLE_DEVICES=0 ollama serve &")
+            logger.error("2. CUDA_VISIBLE_DEVICES=0 python llm_service.py --model_name qwen2.5:7b --host 0.0.0.0 --port 8000")
+            return
     
     # 创建输出目录
     os.makedirs(CONFIG['output_dir'], exist_ok=True)
