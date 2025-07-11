@@ -3,7 +3,7 @@
 """
 音频质量评估脚本 (多卡并行版本)
 使用Kimi-Audio模型对降噪前后的音频进行识别和WER计算
-使用webrtcvad进行VAD，基于语音段能量计算gain值
+使用TEN-VAD进行VAD，基于语音段能量计算gain值
 支持多GPU并行处理
 通过HTTP API调用LLM服务进行文本标准化
 """
@@ -23,7 +23,6 @@ import torch
 from jiwer import wer, cer
 from datetime import datetime
 import warnings
-import webrtcvad
 import struct
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
@@ -32,6 +31,10 @@ import pickle
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# 添加TEN VAD路径
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../include")))
+from ten_vad import TenVad
 
 # 设置代理绕过，确保可以访问本地LLM服务
 os.environ['no_proxy'] = 'localhost,127.0.0.1,::1'
@@ -45,20 +48,28 @@ logger = logging.getLogger(__name__)
 
 # 配置参数
 CONFIG = {
-    'original_dir': "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid",
-    'enhanced_dir': "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_zipenhancer_enhanced",
-    'output_dir': "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_zipenhancer_enhanced_quality_assessment",
+    # 多目录配置：每个元素包含一个目录组的配置
+    'directory_configs': [
+        {
+            'name': 'default',  # 配置名称
+            'original_dir': "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid",
+            'enhanced_dir': "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_zipenhancer_enhanced",
+            'output_dir': "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_zipenhancer_enhanced_quality_assessment",
+            'volume_matching': True,  # 是否启用音量匹配
+            'volume_matching_method': 'ten_vad_energy',  # 音量匹配方法
+        }
+    ],
+    # 全局配置
     'kimi_model_path': "/root/data/pretrained_models/Kimi-Audio-7B-Instruct",
     'kimi_audio_dir': "/root/code/github_repos/Kimi-Audio",
     'device': "cuda:0",
     'target_sr': 16000,  # Kimi-Audio期望的采样率
     'batch_size': 8,
     'num_workers': 4,
-    'skip_existing': True,
+    'skip_existing': False,
     'max_audio_length': 600,  # 最大音频长度（秒）
-    'volume_matching_method': 'vad_energy',  # 音量匹配方法: 'vad_energy'
-    'vad_aggressiveness': 3,  # VAD积极性等级 (0-3)
-    'vad_frame_duration': 30,  # VAD帧长度（毫秒）
+    'ten_vad_hop_size': 256,  # TEN VAD帧跳跃大小（样本数，256样本=16ms@16kHz）
+    'ten_vad_threshold': 0.5,  # TEN VAD阈值
     'num_gpus': 3,  # GPU数量（GPU 1,2,3用于ASR，GPU 0用于LLM服务）
     'gpu_ids': [1, 2, 3],  # GPU ID列表
     'text_normalization': 'llm',  # 文本标准化级别: 'basic', 'advanced', 'llm'
@@ -79,9 +90,11 @@ class AudioVolumeProcessor:
     def __init__(self, sr: int = 16000):
         self.sr = sr
         self.eps = 1e-8  # 避免除零错误
-        self.vad = webrtcvad.Vad(CONFIG['vad_aggressiveness'])
-        self.frame_duration = CONFIG['vad_frame_duration']  # 毫秒
-        self.frame_size = int(sr * self.frame_duration / 1000)  # 样本数
+        self.hop_size = CONFIG['ten_vad_hop_size']  # TEN VAD帧跳跃大小
+        self.threshold = CONFIG['ten_vad_threshold']  # TEN VAD阈值
+        self.vad = TenVad(self.hop_size, self.threshold)
+        
+        logger.info(f"初始化TEN VAD: hop_size={self.hop_size}, threshold={self.threshold}")
     
     def audio_to_int16(self, audio: np.ndarray) -> np.ndarray:
         """将浮点音频转换为int16格式"""
@@ -91,33 +104,45 @@ class AudioVolumeProcessor:
         return (audio * 32767).astype(np.int16)
     
     def perform_vad(self, audio: np.ndarray) -> List[bool]:
-        """执行语音活动检测"""
+        """执行语音活动检测 - 使用TEN VAD"""
         try:
             # 转换为int16格式
             audio_int16 = self.audio_to_int16(audio)
             
-            # 确保音频长度是帧大小的整数倍
-            num_frames = len(audio_int16) // self.frame_size
-            audio_padded = audio_int16[:num_frames * self.frame_size]
-            
-            # 将音频分帧
-            frames = audio_padded.reshape(-1, self.frame_size)
+            # 计算帧数
+            num_frames = len(audio_int16) // self.hop_size
             
             # 对每帧进行VAD
             vad_results = []
-            for frame in frames:
-                # 转换为bytes
-                frame_bytes = frame.tobytes()
-                # 进行VAD检测
-                is_speech = self.vad.is_speech(frame_bytes, self.sr)
-                vad_results.append(is_speech)
+            for i in range(num_frames):
+                # 提取音频帧
+                start_idx = i * self.hop_size
+                end_idx = start_idx + self.hop_size
+                
+                if end_idx <= len(audio_int16):
+                    audio_frame = audio_int16[start_idx:end_idx]
+                    
+                    # 进行TEN VAD检测
+                    out_probability, out_flag = self.vad.process(audio_frame)
+                    vad_results.append(bool(out_flag))
+                else:
+                    # 处理最后一帧（可能不足hop_size长度）
+                    audio_frame = audio_int16[start_idx:]
+                    if len(audio_frame) > 0:
+                        # 填充到hop_size长度
+                        padded_frame = np.zeros(self.hop_size, dtype=np.int16)
+                        padded_frame[:len(audio_frame)] = audio_frame
+                        
+                        out_probability, out_flag = self.vad.process(padded_frame)
+                        vad_results.append(bool(out_flag))
             
+            logger.debug(f"TEN VAD检测完成: 总帧数={num_frames}, 语音帧数={sum(vad_results)}")
             return vad_results
             
         except Exception as e:
-            logger.warning(f"VAD检测失败: {e}")
+            logger.warning(f"TEN VAD检测失败: {e}")
             # 如果VAD失败，返回全部为语音的结果
-            num_frames = len(audio) // self.frame_size
+            num_frames = len(audio) // self.hop_size
             return [True] * num_frames
     
     def extract_speech_segments(self, audio: np.ndarray) -> np.ndarray:
@@ -134,15 +159,15 @@ class AudioVolumeProcessor:
             speech_segments = []
             for i, is_speech in enumerate(vad_results):
                 if is_speech:
-                    start_idx = i * self.frame_size
-                    end_idx = (i + 1) * self.frame_size
+                    start_idx = i * self.hop_size
+                    end_idx = (i + 1) * self.hop_size
                     if end_idx <= len(audio):
                         speech_segments.append(audio[start_idx:end_idx])
             
             if speech_segments:
                 # 连接所有语音段
                 speech_audio = np.concatenate(speech_segments)
-                logger.info(f"VAD检测: 原始长度 {len(audio)/self.sr:.2f}s, 语音段长度 {len(speech_audio)/self.sr:.2f}s")
+                logger.info(f"TEN VAD检测: 原始长度 {len(audio)/self.sr:.2f}s, 语音段长度 {len(speech_audio)/self.sr:.2f}s")
                 return speech_audio
             else:
                 logger.warning("未找到有效语音段，返回原始音频")
@@ -183,12 +208,12 @@ class AudioVolumeProcessor:
             # 确保gain在合理范围内
             gain = np.clip(gain, 0.1, 10.0)
             
-            logger.info(f"VAD能量计算: 参考能量={ref_energy:.6f}, 增强能量={enh_energy:.6f}, gain={gain:.4f}")
+            logger.info(f"TEN VAD能量计算: 参考能量={ref_energy:.6f}, 增强能量={enh_energy:.6f}, gain={gain:.4f}")
             
             return gain
             
         except Exception as e:
-            logger.warning(f"VAD能量gain计算失败: {e}")
+            logger.warning(f"TEN VAD能量gain计算失败: {e}")
             return 1.0
     
     def apply_gain(self, audio: np.ndarray, gain: float) -> Tuple[np.ndarray, float]:
@@ -488,8 +513,9 @@ class KimiAudioProcessor:
 class QualityAssessmentProcessor:
     """质量评估处理器"""
     
-    def __init__(self, config: Dict, gpu_id: int = 0):
+    def __init__(self, config: Dict, dir_config: Dict, gpu_id: int = 0):
         self.config = config
+        self.dir_config = dir_config  # 当前目录配置
         self.gpu_id = gpu_id
         self.device = f"cuda:{gpu_id}"
         self.volume_processor = AudioVolumeProcessor(sr=config['target_sr'])
@@ -499,6 +525,10 @@ class QualityAssessmentProcessor:
             kimi_audio_dir=config['kimi_audio_dir'],
             gpu_id=gpu_id
         )
+        
+        # 从目录配置中获取volume_matching设置
+        self.volume_matching = dir_config.get('volume_matching', True)
+        self.volume_matching_method = dir_config.get('volume_matching_method', 'vad_energy')
         
         # 初始化HTTP文本标准化器（如果启用）
         self.http_normalizer = None
@@ -540,17 +570,13 @@ class QualityAssessmentProcessor:
             
             # 重采样
             if sr != target_sr:
-                audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr, res_type="soxr_vhq")
             
             # 限制长度
             max_samples = int(self.config['max_audio_length'] * target_sr)
             if len(audio) > max_samples:
                 audio = audio[:max_samples]
                 logger.warning(f"音频长度超过限制，截断至{self.config['max_audio_length']}秒")
-            
-            # 归一化
-            if np.max(np.abs(audio)) > 0:
-                audio = audio / np.max(np.abs(audio)) * 0.95
             
             return audio, target_sr
             
@@ -750,7 +776,8 @@ class QualityAssessmentProcessor:
             'cer': 0.0,
             'is_usable': False,  # CER<5%的音频才可用
             'volume_scale_factor': 1.0,
-            'volume_matching_method': self.config['volume_matching_method'],
+            'volume_matching_enabled': self.volume_matching,
+            'volume_matching_method': self.volume_matching_method,
             'processing_time': 0.0,
             'success': False,
             'error_message': '',
@@ -765,6 +792,12 @@ class QualityAssessmentProcessor:
                 'use_llm_normalization': self.config.get('use_llm_normalization', False),
                 'llm_service_url': self.config.get('llm_service_url', ''),
                 'llm_enabled': self.http_normalizer is not None
+            },
+            'directory_config': {
+                'name': self.dir_config.get('name', 'unknown'),
+                'original_dir': self.dir_config.get('original_dir', ''),
+                'enhanced_dir': self.dir_config.get('enhanced_dir', ''),
+                'output_dir': self.dir_config.get('output_dir', ''),
             }
         }
         
@@ -795,14 +828,23 @@ class QualityAssessmentProcessor:
             
             # 计算gain并应用到增强音频
             logger.info(f"GPU {self.gpu_id}: 计算并应用gain...")
-            if self.config['volume_matching_method'] == 'vad_energy':
-                gain = self.volume_processor.calculate_gain_vad_energy(original_audio, enhanced_audio)
-                matched_audio, actual_gain = self.volume_processor.apply_gain(enhanced_audio, gain)
-                result['volume_scale_factor'] = actual_gain
+            if self.volume_matching:
+                if self.volume_matching_method == 'ten_vad_energy':
+                    gain = self.volume_processor.calculate_gain_vad_energy(original_audio, enhanced_audio)
+                    matched_audio, actual_gain = self.volume_processor.apply_gain(enhanced_audio, gain)
+                    result['volume_scale_factor'] = actual_gain
+                else:
+                    # 其他方法暂时直接返回原音频
+                    matched_audio = enhanced_audio
+                    result['volume_scale_factor'] = 1.0
             else:
-                # 其他方法暂时直接返回原音频
+                # 不进行音量匹配
                 matched_audio = enhanced_audio
                 result['volume_scale_factor'] = 1.0
+                logger.info(f"GPU {self.gpu_id}: 跳过音量匹配（已禁用）")
+            
+            result['volume_matching_enabled'] = self.volume_matching
+            result['volume_matching_method'] = self.volume_matching_method
             
             # 保存处理后的音频（按原始目录结构）
             audio_basename = os.path.splitext(os.path.basename(relative_path))[0]
@@ -899,7 +941,7 @@ class QualityAssessmentProcessor:
         logger.info(f"GPU {self.gpu_id}: 开始处理子集 {subset_id}，共 {len(audio_pairs)} 个音频对")
         
         # 创建子集输出目录
-        subset_output_dir = os.path.join(self.config['output_dir'], f"subset_{subset_id}")
+        subset_output_dir = os.path.join(self.dir_config['output_dir'], f"subset_{subset_id}")
         os.makedirs(subset_output_dir, exist_ok=True)
         
         # 处理音频对
@@ -912,7 +954,7 @@ class QualityAssessmentProcessor:
             # 检查是否跳过已存在的结果
             if self.config['skip_existing']:
                 # 计算相对路径和基础文件名
-                relative_path = os.path.relpath(original_path, self.config['original_dir'])
+                relative_path = os.path.relpath(original_path, self.dir_config['original_dir'])
                 audio_basename = os.path.splitext(os.path.basename(relative_path))[0]
                 result_file = os.path.join(
                     subset_output_dir,
@@ -930,7 +972,7 @@ class QualityAssessmentProcessor:
             
             # 处理音频对
             result = self.process_audio_pair(
-                original_path, enhanced_path, subset_output_dir, self.config['original_dir']
+                original_path, enhanced_path, subset_output_dir, self.dir_config['original_dir']
             )
             results.append(result)
             
@@ -952,22 +994,22 @@ class QualityAssessmentProcessor:
         
         return results
 
-    def get_audio_pairs(self) -> List[Tuple[str, str]]:
+    def get_audio_pairs(self, dir_config: Dict) -> List[Tuple[str, str]]:
         """获取音频对列表"""
         audio_pairs = []
         
         # 遍历原始音频目录
-        for root, dirs, files in os.walk(self.config['original_dir']):
+        for root, dirs, files in os.walk(dir_config['original_dir']):
             for file in files:
                 if file.lower().endswith(('.wav', '.mp3', '.flac', '.m4a')):
                     original_path = os.path.join(root, file)
                     
                     # 计算相对路径
-                    rel_path = os.path.relpath(original_path, self.config['original_dir'])
+                    rel_path = os.path.relpath(original_path, dir_config['original_dir'])
                     
                     # 构造增强音频路径
                     enhanced_path = os.path.join(
-                        self.config['enhanced_dir'],
+                        dir_config['enhanced_dir'],
                         os.path.splitext(rel_path)[0] + '.wav'
                     )
                     
@@ -1008,7 +1050,7 @@ def split_audio_pairs(audio_pairs: List[Tuple[str, str]], num_splits: int) -> Li
 
 def process_gpu_subset(args_tuple):
     """处理单个GPU子集的函数"""
-    gpu_id, audio_pairs_subset, config, subset_id = args_tuple
+    gpu_id, audio_pairs_subset, config, dir_config, subset_id = args_tuple
     
     try:
         # 设置进程的GPU环境变量
@@ -1020,7 +1062,7 @@ def process_gpu_subset(args_tuple):
             torch.cuda.set_device(0)  # 因为CUDA_VISIBLE_DEVICES已经设置，所以这里用0
             
         # 创建处理器
-        processor = QualityAssessmentProcessor(config, gpu_id)
+        processor = QualityAssessmentProcessor(config, dir_config, gpu_id)
         
         # 处理子集
         results = processor.run_assessment_subset(audio_pairs_subset, subset_id)
@@ -1033,9 +1075,9 @@ def process_gpu_subset(args_tuple):
         traceback.print_exc()
         return []
 
-def merge_results(output_dir: str, num_gpus: int, config: Dict):
+def merge_results(output_dir: str, num_gpus: int, config: Dict, dir_config: Dict):
     """合并所有GPU的结果"""
-    logger.info("开始合并结果...")
+    logger.info(f"开始合并结果 - 目录: {dir_config['name']}")
     
     all_results = []
     
@@ -1078,6 +1120,7 @@ def merge_results(output_dir: str, num_gpus: int, config: Dict):
         usable_cer_scores = [r['cer'] for r in usable_results]
         
         summary = {
+            'directory_config': dir_config,
             'total_pairs': len(all_results),
             'successful_pairs': len(successful_results),
             'failed_pairs': len(all_results) - len(successful_results),
@@ -1098,11 +1141,12 @@ def merge_results(output_dir: str, num_gpus: int, config: Dict):
             'usable_average_cer': float(np.mean(usable_cer_scores)) if usable_cer_scores else 0.0,
             'usable_median_wer': float(np.median(usable_wer_scores)) if usable_wer_scores else 0.0,
             'usable_median_cer': float(np.median(usable_cer_scores)) if usable_cer_scores else 0.0,
-            'config': config,
+            'global_config': config,
             'timestamp': datetime.now().isoformat()
         }
     else:
         summary = {
+            'directory_config': dir_config,
             'total_pairs': len(all_results),
             'successful_pairs': 0,
             'failed_pairs': len(all_results),
@@ -1122,7 +1166,7 @@ def merge_results(output_dir: str, num_gpus: int, config: Dict):
             'usable_average_cer': 0.0,
             'usable_median_wer': 0.0,
             'usable_median_cer': 0.0,
-            'config': config,
+            'global_config': config,
             'timestamp': datetime.now().isoformat()
         }
     
@@ -1142,15 +1186,17 @@ def merge_results(output_dir: str, num_gpus: int, config: Dict):
     logger.info(f"合并结果保存到: {output_dir}")
     
     # 打印统计摘要
-    print_summary(all_results)
+    print_summary(all_results, dir_config)
+    
+    return all_results
 
-def print_summary(results: List[Dict]):
+def print_summary(results: List[Dict], dir_config: Dict):
     """打印统计摘要"""
     successful_results = [r for r in results if r['success']]
     usable_results = [r for r in successful_results if r.get('is_usable', False)]
     
     print("\n" + "=" * 80)
-    print("音频质量评估结果摘要 (多GPU并行)")
+    print(f"音频质量评估结果摘要 - 目录: {dir_config['name']}")
     print("=" * 80)
     print(f"总音频对数:     {len(results)}")
     print(f"成功处理:       {len(successful_results)}")
@@ -1220,22 +1266,22 @@ def print_summary(results: List[Dict]):
     
     print("=" * 80)
 
-def get_audio_pairs(config: Dict) -> List[Tuple[str, str]]:
+def get_audio_pairs(dir_config: Dict) -> List[Tuple[str, str]]:
     """获取音频对列表"""
     audio_pairs = []
     
     # 遍历原始音频目录
-    for root, dirs, files in os.walk(config['original_dir']):
+    for root, dirs, files in os.walk(dir_config['original_dir']):
         for file in files:
             if file.lower().endswith(('.wav', '.mp3', '.flac', '.m4a')):
                 original_path = os.path.join(root, file)
                 
                 # 计算相对路径
-                rel_path = os.path.relpath(original_path, config['original_dir'])
+                rel_path = os.path.relpath(original_path, dir_config['original_dir'])
                 
                 # 构造增强音频路径
                 enhanced_path = os.path.join(
-                    config['enhanced_dir'],
+                    dir_config['enhanced_dir'],
                     os.path.splitext(rel_path)[0] + '.wav'
                 )
                 
@@ -1256,36 +1302,56 @@ def main():
         # 如果已经设置过了，就忽略
         pass
     
-    parser = argparse.ArgumentParser(description="音频质量评估脚本 (多GPU并行)")
-    parser.add_argument("--original_dir", type=str, 
-                       default=CONFIG['original_dir'],
-                       help="原始音频目录")
+    parser = argparse.ArgumentParser(description="音频质量评估脚本 (多GPU并行) - 支持多目录处理")
+    
+    # 多目录配置相关参数
+    parser.add_argument("--config_file", type=str, 
+                       help="配置文件路径（JSON格式），优先级高于命令行参数")
+    parser.add_argument("--original_dirs", type=str, nargs='+',
+                       help="原始音频目录列表")
+    parser.add_argument("--enhanced_dirs", type=str, nargs='+',
+                       help="增强音频目录列表")
+    parser.add_argument("--output_dirs", type=str, nargs='+',
+                       help="输出目录列表")
+    parser.add_argument("--config_names", type=str, nargs='+',
+                       help="配置名称列表")
+    parser.add_argument("--volume_matching", type=str, nargs='+',
+                       choices=['true', 'false'],
+                       help="每个目录是否启用音量匹配（true/false）")
+    parser.add_argument("--volume_methods", type=str, nargs='+',
+                       choices=['ten_vad_energy'],
+                       help="每个目录的音量匹配方法")
+    
+    # 向后兼容的单目录参数
+    parser.add_argument("--original_dir", type=str,
+                       help="原始音频目录（单目录模式）")
     parser.add_argument("--enhanced_dir", type=str,
-                       default=CONFIG['enhanced_dir'],
-                       help="增强音频目录")
+                       help="增强音频目录（单目录模式）")
     parser.add_argument("--output_dir", type=str,
-                       default=CONFIG['output_dir'],
-                       help="输出目录")
+                       help="输出目录（单目录模式）")
+    parser.add_argument("--volume_method", type=str,
+                       choices=['ten_vad_energy'],
+                       help="音量匹配方法（单目录模式）")
+    
+    # 全局配置参数
     parser.add_argument("--kimi_model_path", type=str,
                        default=CONFIG['kimi_model_path'],
                        help="Kimi-Audio模型路径")
     parser.add_argument("--kimi_audio_dir", type=str,
                        default=CONFIG['kimi_audio_dir'],
                        help="Kimi-Audio代码目录")
-    parser.add_argument("--volume_method", type=str,
-                       default=CONFIG['volume_matching_method'],
-                       choices=['vad_energy'],
-                       help="音量匹配方法")
     parser.add_argument("--skip_existing", action="store_true",
                        default=CONFIG['skip_existing'],
                        help="跳过已存在的结果")
     parser.add_argument("--max_audio_length", type=int,
                        default=CONFIG['max_audio_length'],
                        help="最大音频长度（秒）")
-    parser.add_argument("--vad_aggressiveness", type=int,
-                       default=CONFIG['vad_aggressiveness'],
-                       choices=[0, 1, 2, 3],
-                       help="VAD积极性等级 (0-3)")
+    parser.add_argument("--ten_vad_hop_size", type=int,
+                       default=CONFIG['ten_vad_hop_size'],
+                       help="TEN VAD帧跳跃大小（样本数，256样本=16ms@16kHz）")
+    parser.add_argument("--ten_vad_threshold", type=float,
+                       default=CONFIG['ten_vad_threshold'],
+                       help="TEN VAD阈值（0.0-1.0）")
     parser.add_argument("--num_gpus", type=int,
                        default=CONFIG['num_gpus'],
                        help="GPU数量（GPU 1,2,3用于ASR，GPU 0用于LLM服务）")
@@ -1326,67 +1392,127 @@ def main():
     
     args = parser.parse_args()
     
-    # 更新配置
-    CONFIG.update(vars(args))
+    # 处理配置文件
+    if args.config_file:
+        try:
+            with open(args.config_file, 'r', encoding='utf-8') as f:
+                file_config = json.load(f)
+            
+            # 合并配置文件到全局配置
+            for key, value in file_config.items():
+                if key in CONFIG:
+                    CONFIG[key] = value
+            
+            logger.info(f"从配置文件加载配置: {args.config_file}")
+        except Exception as e:
+            logger.error(f"加载配置文件失败: {e}")
+            return
+    
+    # 处理目录配置
+    directory_configs = []
+    
+    # 检查是否提供了多目录参数
+    if args.original_dirs:
+        # 多目录模式
+        num_configs = len(args.original_dirs)
+        
+        # 验证参数长度一致性
+        if not args.enhanced_dirs or len(args.enhanced_dirs) != num_configs:
+            logger.error("enhanced_dirs数量必须与original_dirs数量一致")
+            return
+        if not args.output_dirs or len(args.output_dirs) != num_configs:
+            logger.error("output_dirs数量必须与original_dirs数量一致")
+            return
+        
+        # 设置默认值
+        config_names = args.config_names or [f"config_{i+1}" for i in range(num_configs)]
+        volume_matching = args.volume_matching or ['true'] * num_configs
+        volume_methods = args.volume_methods or ['ten_vad_energy'] * num_configs
+        
+        # 验证默认值长度
+        if len(config_names) != num_configs:
+            config_names = [f"config_{i+1}" for i in range(num_configs)]
+        if len(volume_matching) != num_configs:
+            volume_matching = ['true'] * num_configs
+        if len(volume_methods) != num_configs:
+            volume_methods = ['ten_vad_energy'] * num_configs
+        
+        # 创建目录配置
+        for i in range(num_configs):
+            directory_configs.append({
+                'name': config_names[i],
+                'original_dir': args.original_dirs[i],
+                'enhanced_dir': args.enhanced_dirs[i],
+                'output_dir': args.output_dirs[i],
+                'volume_matching': volume_matching[i].lower() == 'true',
+                'volume_matching_method': volume_methods[i],
+            })
+    
+    elif args.original_dir:
+        # 单目录模式（向后兼容）
+        directory_configs.append({
+            'name': 'single_dir',
+            'original_dir': args.original_dir,
+            'enhanced_dir': args.enhanced_dir,
+            'output_dir': args.output_dir,
+            'volume_matching': True,
+            'volume_matching_method': args.volume_method or 'ten_vad_energy',
+        })
+    
+    else:
+        # 使用默认配置
+        directory_configs = CONFIG['directory_configs']
+    
+    # 更新CONFIG
+    CONFIG['directory_configs'] = directory_configs
+    
+    # 更新全局配置
+    global_config_keys = ['kimi_model_path', 'kimi_audio_dir', 'skip_existing', 
+                         'max_audio_length', 'ten_vad_hop_size', 'ten_vad_threshold',
+                         'num_gpus', 'gpu_ids', 'text_normalization', 'remove_punctuation',
+                         'normalize_spacing', 'handle_spelling', 'spelling_max_length',
+                         'preserve_common_words', 'llm_service_url', 'llm_timeout',
+                         'llm_max_retries', 'use_llm_normalization']
+    
+    for key in global_config_keys:
+        if hasattr(args, key) and getattr(args, key) is not None:
+            CONFIG[key] = getattr(args, key)
     
     # 确保GPU数量和ID列表一致
     if len(CONFIG['gpu_ids']) != CONFIG['num_gpus']:
         CONFIG['gpu_ids'] = list(range(1, CONFIG['num_gpus'] + 1))  # 默认使用GPU 1,2,3...
     
-    print("音频质量评估脚本 (多GPU并行版本 - qwen2.5:7b)")
-    print("=" * 70)
-    print(f"原始音频目录: {CONFIG['original_dir']}")
-    print(f"增强音频目录: {CONFIG['enhanced_dir']}")
-    print(f"输出目录: {CONFIG['output_dir']}")
+    # 打印配置信息
+    print("音频质量评估脚本 (多GPU并行版本 - 支持多目录处理)")
+    print("=" * 80)
+    print(f"目录配置数量: {len(CONFIG['directory_configs'])}")
+    for i, dir_config in enumerate(CONFIG['directory_configs']):
+        print(f"\n目录配置 {i+1}: {dir_config['name']}")
+        print(f"  原始音频目录: {dir_config['original_dir']}")
+        print(f"  增强音频目录: {dir_config['enhanced_dir']}")
+        print(f"  输出目录: {dir_config['output_dir']}")
+        print(f"  音量匹配: {'启用' if dir_config['volume_matching'] else '禁用'}")
+        if dir_config['volume_matching']:
+            print(f"  音量匹配方法: {dir_config['volume_matching_method']}")
+    
+    print(f"\n全局配置:")
     print(f"Kimi-Audio模型: {CONFIG['kimi_model_path']}")
     print(f"Kimi-Audio目录: {CONFIG['kimi_audio_dir']}")
-    print(f"GPU配置: GPU 0 (LLM服务 - qwen2.5:7b), GPU {CONFIG['gpu_ids']} (ASR)")
+    print(f"GPU配置: GPU 0 (LLM服务), GPU {CONFIG['gpu_ids']} (ASR)")
     print(f"ASR GPU数量: {CONFIG['num_gpus']}")
-    print(f"ASR GPU ID列表: {CONFIG['gpu_ids']}")
-    print(f"音量匹配方法: {CONFIG['volume_matching_method']}")
-    print(f"VAD积极性等级: {CONFIG['vad_aggressiveness']}")
+    print(f"文本标准化级别: {CONFIG['text_normalization']}")
+    print(f"TEN VAD配置: hop_size={CONFIG['ten_vad_hop_size']}, threshold={CONFIG['ten_vad_threshold']}")
     print(f"跳过已存在: {CONFIG['skip_existing']}")
     print(f"最大音频长度: {CONFIG['max_audio_length']} 秒")
-    print(f"文本标准化级别: {CONFIG['text_normalization']}")
-    if CONFIG['text_normalization'] == 'llm':
-        print(f"LLM服务URL: {CONFIG['llm_service_url']}")
-        print(f"LLM模型: qwen2.5:7b (GPU 0)")
-        print(f"LLM超时时间: {CONFIG['llm_timeout']} 秒")
-        print(f"LLM最大重试: {CONFIG['llm_max_retries']}")
-        print(f"使用LLM标准化: {CONFIG['use_llm_normalization']}")
-    else:
-        print(f"移除标点符号: {CONFIG['remove_punctuation']}")
-        print(f"标准化空格: {CONFIG['normalize_spacing']}")
-        print(f"处理拼读问题: {CONFIG['handle_spelling']}")
-        if CONFIG['handle_spelling']:
-            print(f"拼读检测最大长度: {CONFIG['spelling_max_length']}")
-            print(f"保留常见单词: {CONFIG['preserve_common_words']}")
-    print("已启用: spawn多进程模式 (CUDA兼容)")
-    print("已启用: 代理绕过 (避免网络拦截)")
-    print("通过HTTP API调用LLM服务")
-    print("=" * 70)
+    print("=" * 80)
     
-    # 检查输入目录
-    if not os.path.exists(CONFIG['original_dir']):
-        logger.error(f"原始音频目录不存在: {CONFIG['original_dir']}")
-        return
-    
-    if not os.path.exists(CONFIG['enhanced_dir']):
-        logger.error(f"增强音频目录不存在: {CONFIG['enhanced_dir']}")
-        return
-    
-    # 检查Kimi-Audio模型
+    # 验证基本配置
     if not os.path.exists(CONFIG['kimi_model_path']):
         logger.error(f"Kimi-Audio模型路径不存在: {CONFIG['kimi_model_path']}")
-        logger.error("请先下载Kimi-Audio模型：")
-        logger.error("huggingface-cli download moonshotai/Kimi-Audio-7B-Instruct --local-dir /path/to/model")
         return
     
-    # 检查Kimi-Audio代码目录
     if not os.path.exists(CONFIG['kimi_audio_dir']):
         logger.error(f"Kimi-Audio代码目录不存在: {CONFIG['kimi_audio_dir']}")
-        logger.error("请先克隆Kimi-Audio代码仓库：")
-        logger.error("git clone https://github.com/moonshotai/Kimi-Audio.git")
         return
     
     # 检查GPU可用性
@@ -1400,13 +1526,10 @@ def main():
         logger.error(f"可用GPU数量({available_gpus})不足，需要GPU {max_required_gpu}")
         return
     
-    print(f"✓ 检测到{available_gpus}个GPU，将使用GPU {CONFIG['gpu_ids']}进行ASR")
-    
     # 检查LLM服务连接（如果启用）
     if CONFIG.get('use_llm_normalization', False) and CONFIG.get('text_normalization') == 'llm':
         try:
             import requests
-            # 设置代理绕过
             session = requests.Session()
             session.proxies = {'http': None, 'https': None}
             
@@ -1414,85 +1537,113 @@ def main():
             response = session.get(health_url, timeout=10)
             response.raise_for_status()
             print(f"✓ LLM服务连接正常: {CONFIG['llm_service_url']}")
-            
-            # 获取模型信息
-            try:
-                model_info_url = f"{CONFIG['llm_service_url']}/model_info"
-                response = session.get(model_info_url, timeout=10)
-                response.raise_for_status()
-                info = response.json()
-                print(f"✓ LLM模型信息: {info.get('model_name', 'unknown')}")
-            except Exception as e:
-                logger.warning(f"无法获取LLM模型信息: {e}")
-                
         except Exception as e:
             logger.error(f"LLM服务连接失败: {e}")
-            logger.error("请确保LLM服务已启动在GPU 0上")
-            logger.error("启动命令:")
-            logger.error("1. CUDA_VISIBLE_DEVICES=0 ollama serve &")
-            logger.error("2. CUDA_VISIBLE_DEVICES=0 python llm_service.py --model_name qwen2.5:7b --host 0.0.0.0 --port 8000")
             return
     
-    # 创建输出目录
-    os.makedirs(CONFIG['output_dir'], exist_ok=True)
+    # 处理每个目录配置
+    total_start_time = time.time()
+    all_directory_results = []
     
-    # 获取音频对列表
-    logger.info("获取音频对列表...")
-    audio_pairs = get_audio_pairs(CONFIG)
-    
-    if not audio_pairs:
-        logger.error("未找到音频对")
-        return
-    
-    logger.info(f"找到 {len(audio_pairs)} 个音频对")
-    
-    # 分割音频对
-    logger.info(f"将音频对分成 {CONFIG['num_gpus']} 个子集...")
-    audio_pairs_splits = split_audio_pairs(audio_pairs, CONFIG['num_gpus'])
-    
-    for i, split in enumerate(audio_pairs_splits):
-        logger.info(f"子集 {i}: {len(split)} 个音频对")
-    
-    # 准备多进程参数
-    process_args = []
-    for i, (gpu_id, audio_pairs_subset) in enumerate(zip(CONFIG['gpu_ids'], audio_pairs_splits)):
-        process_args.append((gpu_id, audio_pairs_subset, CONFIG, i))
-    
-    # 启动多进程处理
-    try:
-        logger.info("启动多GPU并行处理...")
-        start_time = time.time()
+    for dir_idx, dir_config in enumerate(CONFIG['directory_configs']):
+        print(f"\n{'='*80}")
+        print(f"开始处理目录配置 {dir_idx+1}/{len(CONFIG['directory_configs'])}: {dir_config['name']}")
+        print(f"{'='*80}")
         
-        # 使用进程池并行处理，使用spawn方法
-        with ProcessPoolExecutor(max_workers=CONFIG['num_gpus']) as executor:
-            futures = []
-            for args in process_args:
-                future = executor.submit(process_gpu_subset, args)
-                futures.append(future)
+        try:
+            # 验证目录存在
+            if not os.path.exists(dir_config['original_dir']):
+                logger.error(f"原始音频目录不存在: {dir_config['original_dir']}")
+                continue
             
-            # 等待所有进程完成
-            results = []
-            for future in futures:
-                try:
-                    result = future.result()
-                    results.extend(result)
-                except Exception as e:
-                    logger.error(f"进程执行失败: {e}")
+            if not os.path.exists(dir_config['enhanced_dir']):
+                logger.error(f"增强音频目录不存在: {dir_config['enhanced_dir']}")
+                continue
+            
+            # 创建输出目录
+            os.makedirs(dir_config['output_dir'], exist_ok=True)
+            
+            # 获取音频对列表
+            logger.info(f"获取音频对列表: {dir_config['name']}")
+            audio_pairs = get_audio_pairs(dir_config)
+            
+            if not audio_pairs:
+                logger.warning(f"目录 {dir_config['name']} 中未找到音频对")
+                continue
+            
+            logger.info(f"找到 {len(audio_pairs)} 个音频对")
+            
+            # 分割音频对
+            logger.info(f"将音频对分成 {CONFIG['num_gpus']} 个子集...")
+            audio_pairs_splits = split_audio_pairs(audio_pairs, CONFIG['num_gpus'])
+            
+            # 准备多进程参数
+            process_args = []
+            for i, (gpu_id, audio_pairs_subset) in enumerate(zip(CONFIG['gpu_ids'], audio_pairs_splits)):
+                process_args.append((gpu_id, audio_pairs_subset, CONFIG, dir_config, i))
+            
+            # 启动多进程处理
+            logger.info(f"启动多GPU并行处理: {dir_config['name']}")
+            start_time = time.time()
+            
+            with ProcessPoolExecutor(max_workers=CONFIG['num_gpus']) as executor:
+                futures = []
+                for args in process_args:
+                    future = executor.submit(process_gpu_subset, args)
+                    futures.append(future)
+                
+                # 等待所有进程完成
+                results = []
+                for future in futures:
+                    try:
+                        result = future.result()
+                        results.extend(result)
+                    except Exception as e:
+                        logger.error(f"进程执行失败: {e}")
+            
+            processing_time = time.time() - start_time
+            logger.info(f"目录 {dir_config['name']} 处理完成，耗时: {processing_time:.2f} 秒")
+            
+            # 合并结果
+            dir_results = merge_results(dir_config['output_dir'], CONFIG['num_gpus'], CONFIG, dir_config)
+            all_directory_results.extend(dir_results)
+            
+        except Exception as e:
+            logger.error(f"处理目录 {dir_config['name']} 时发生错误: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # 总结所有目录的结果
+    total_processing_time = time.time() - total_start_time
+    
+    print(f"\n{'='*80}")
+    print("所有目录处理完成！")
+    print(f"总处理时间: {total_processing_time:.2f} 秒")
+    print(f"处理的目录数: {len(CONFIG['directory_configs'])}")
+    print(f"总音频对数: {len(all_directory_results)}")
+    print(f"{'='*80}")
+    
+    # 保存总体摘要
+    if all_directory_results:
+        total_summary = {
+            'total_directories': len(CONFIG['directory_configs']),
+            'total_audio_pairs': len(all_directory_results),
+            'total_processing_time': total_processing_time,
+            'directory_configs': CONFIG['directory_configs'],
+            'global_config': CONFIG,
+            'timestamp': datetime.now().isoformat()
+        }
         
-        processing_time = time.time() - start_time
-        logger.info(f"多GPU并行处理完成，耗时: {processing_time:.2f} 秒")
-        
-        # 合并结果
-        merge_results(CONFIG['output_dir'], CONFIG['num_gpus'], CONFIG)
-        
-        print(f"\n评估完成！总耗时: {processing_time:.2f} 秒")
-        print(f"结果保存在: {CONFIG['output_dir']}")
-        
-    except Exception as e:
-        logger.error(f"多GPU并行处理失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+        # 保存到第一个输出目录的上级目录
+        if CONFIG['directory_configs']:
+            summary_dir = os.path.dirname(CONFIG['directory_configs'][0]['output_dir'])
+            summary_file = os.path.join(summary_dir, "multi_directory_summary.json")
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump(total_summary, f, indent=2, ensure_ascii=False)
+            print(f"总体摘要保存到: {summary_file}")
+    
+    return
 
 if __name__ == "__main__":
     main() 

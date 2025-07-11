@@ -1,0 +1,42 @@
+{
+  "directory_configs": [
+    {
+      "name": "King-ASR-EN-Kid_zipenhancer",
+      "original_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid",
+      "enhanced_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_zipenhancer_enhanced",
+      "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_zipenhancer_enhanced_quality_assessment",
+      "volume_matching": true,
+      "volume_matching_method": "ten_vad_energy"
+    },
+    {
+      "name": "King-ASR-EN-Kid_mossformer",
+      "original_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid",
+      "enhanced_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_mossformer_enhanced",
+      "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_mossformer_enhanced_quality_assessment",
+      "volume_matching": false,
+      "volume_matching_method": "ten_vad_energy"
+    }
+  ],
+  "kimi_model_path": "/root/data/pretrained_models/Kimi-Audio-7B-Instruct",
+  "kimi_audio_dir": "/root/code/github_repos/Kimi-Audio",
+  "device": "cuda:0",
+  "target_sr": 16000,
+  "batch_size": 8,
+  "num_workers": 4,
+  "skip_existing": false,
+  "max_audio_length": 600,
+  "ten_vad_hop_size": 256,
+  "ten_vad_threshold": 0.5,
+  "num_gpus": 3,
+  "gpu_ids": [1, 2, 3],
+  "text_normalization": "llm",
+  "remove_punctuation": true,
+  "normalize_spacing": true,
+  "handle_spelling": true,
+  "spelling_max_length": 4,
+  "preserve_common_words": true,
+  "use_llm_normalization": true,
+  "llm_service_url": "http://localhost:8000",
+  "llm_timeout": 30,
+  "llm_max_retries": 3
+} 

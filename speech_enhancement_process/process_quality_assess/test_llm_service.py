@@ -9,6 +9,11 @@ import requests
 import json
 import time
 import sys
+import os
+
+# 设置代理绕过
+os.environ['no_proxy'] = 'localhost,127.0.0.1,::1'
+os.environ['NO_PROXY'] = 'localhost,127.0.0.1,::1'
 
 def test_llm_service(base_url="http://localhost:8000"):
     """测试LLM服务"""

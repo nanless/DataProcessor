@@ -1,3 +1,5 @@
 downloaded_models
 *.log
 *.pyc
+checkpoints/
+logs/

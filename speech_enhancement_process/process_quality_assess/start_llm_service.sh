@@ -4,6 +4,7 @@
 # 使用Ollama部署Qwen3-8B模型
 source /root/miniforge3/etc/profile.d/conda.sh
 conda activate kimi-audio
+mkdir -p ./logs
 
 # 设置代理绕过，确保可以访问本地Ollama服务
 export no_proxy="localhost,127.0.0.1,::1"
