@@ -64,8 +64,8 @@ class ZipEnhancerConfig:
     """ZipEnhancer配置类"""
     
     # 路径配置
-    input_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid"
-    output_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_zipenhancer_enhanced_2"
+    input_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762"
+    output_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762_zipenhancer_enhanced"
     
     # 模型配置
     model_id: str = "iic/speech_zipenhancer_ans_multiloss_16k_base"

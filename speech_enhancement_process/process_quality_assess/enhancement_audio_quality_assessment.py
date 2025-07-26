@@ -53,8 +53,8 @@ CONFIG = {
         {
             'name': 'default',  # 配置名称
             'original_dir': "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid",
-            'enhanced_dir': "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_zipenhancer_enhanced",
-            'output_dir': "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_zipenhancer_enhanced_quality_assessment",
+            'enhanced_dir': "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_resemble_enhanced",
+            'output_dir': "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_resemble_enhanced_quality_assessment",
             'volume_matching': True,  # 是否启用音量匹配
             'volume_matching_method': 'ten_vad_energy',  # 音量匹配方法
         }
@@ -64,22 +64,17 @@ CONFIG = {
     'kimi_audio_dir': "/root/code/github_repos/Kimi-Audio",
     'device': "cuda:0",
     'target_sr': 16000,  # Kimi-Audio期望的采样率
-    'batch_size': 8,
-    'num_workers': 4,
     'skip_existing': False,
     'max_audio_length': 600,  # 最大音频长度（秒）
     'ten_vad_hop_size': 256,  # TEN VAD帧跳跃大小（样本数，256样本=16ms@16kHz）
     'ten_vad_threshold': 0.5,  # TEN VAD阈值
-    'num_gpus': 3,  # GPU数量（GPU 1,2,3用于ASR，GPU 0用于LLM服务）
-    'gpu_ids': [1, 2, 3],  # GPU ID列表
-    'text_normalization': 'llm',  # 文本标准化级别: 'basic', 'advanced', 'llm'
-    'remove_punctuation': True,  # 是否移除标点符号
-    'normalize_spacing': True,  # 是否标准化空格
-    'handle_spelling': True,  # 是否处理拼读问题
-    'spelling_max_length': 4,  # 拼读检测的最大长度
-    'preserve_common_words': True,  # 是否保留常见单词不拆分
+    # GPU配置
+    'num_gpus': 3,  # ASR GPU数量
+    'gpu_ids': [1, 2, 3],  # ASR GPU ID列表
+    # 文本标准化配置 - 只使用LLM
+    'text_normalization': 'llm',  # 文本标准化方式
     'use_llm_normalization': True,  # 是否使用LLM进行文本标准化
-    'llm_service_url': 'http://localhost:8000',  # LLM服务URL
+    'llm_service_url': 'http://localhost:8000',  # 默认LLM服务URL（单组时使用）
     'llm_timeout': 30,  # LLM服务超时时间（秒）
     'llm_max_retries': 3,  # LLM服务最大重试次数
 }
@@ -239,13 +234,16 @@ class AudioVolumeProcessor:
             return audio, 1.0
 
 class HTTPTextNormalizer:
-    """基于HTTP API的文本标准化器"""
+    """基于HTTP API的文本标准化器 - 带服务自动恢复功能"""
     
     def __init__(self, service_url: str, timeout: int = 30, max_retries: int = 3, gpu_id: int = 0):
         self.service_url = service_url.rstrip('/')
         self.timeout = timeout
         self.max_retries = max_retries
         self.gpu_id = gpu_id
+        self.service_restart_attempts = 0
+        self.max_service_restarts = 3
+        self.restart_lock_file = "/tmp/llm_service_restart.lock"
         
         # 创建HTTP会话，配置重试策略和代理绕过
         self.session = requests.Session()
@@ -277,8 +275,109 @@ class HTTPTextNormalizer:
         logger.info(f"GPU {gpu_id}: 超时时间: {self.timeout}s")
         logger.info(f"GPU {gpu_id}: 最大重试: {self.max_retries}")
         
-        # 测试连接
+        # 测试连接（严格检查，失败时抛出异常）
         self._test_connection()
+    
+    def _restart_llm_service(self) -> bool:
+        """重启LLM服务（带锁机制避免多进程冲突）"""
+        import subprocess
+        import time
+        import os
+        import fcntl
+        
+        if self.service_restart_attempts >= self.max_service_restarts:
+            logger.error(f"GPU {self.gpu_id}: 达到最大服务重启次数限制 ({self.max_service_restarts})")
+            return False
+        
+        # 尝试获取重启锁
+        try:
+            lock_fd = os.open(self.restart_lock_file, os.O_CREAT | os.O_TRUNC | os.O_RDWR)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            logger.info(f"GPU {self.gpu_id}: 获得服务重启锁")
+        except (OSError, IOError):
+            logger.info(f"GPU {self.gpu_id}: 其他进程正在重启服务，等待完成...")
+            # 等待其他进程完成重启
+            for wait_attempt in range(30):  # 最多等待60秒
+                time.sleep(2)
+                if self._test_connection_quiet():
+                    logger.info(f"GPU {self.gpu_id}: 服务已被其他进程恢复")
+                    return True
+            logger.warning(f"GPU {self.gpu_id}: 等待其他进程重启超时")
+            return False
+        
+        try:
+            self.service_restart_attempts += 1
+            logger.warning(f"GPU {self.gpu_id}: 开始重启LLM服务 (第{self.service_restart_attempts}次)")
+            
+            # 清除可能的proxy干扰
+            env = os.environ.copy()
+            env.pop('http_proxy', None)
+            env.pop('https_proxy', None)
+            env.pop('HTTP_PROXY', None)
+            env.pop('HTTPS_PROXY', None)
+            
+            # 停止现有服务
+            logger.info(f"GPU {self.gpu_id}: 停止现有LLM服务...")
+            stop_result = subprocess.run(
+                ["./stop_multi_llm_services.sh"],
+                cwd="/root/code/github_repos/DataProcessor/speech_enhancement_process/process_quality_assess",
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            # 等待服务完全停止
+            time.sleep(5)
+            
+            # 重新启动服务
+            logger.info(f"GPU {self.gpu_id}: 重新启动LLM服务...")
+            start_result = subprocess.run(
+                ["./auto_start_llm_services.sh"],
+                cwd="/root/code/github_repos/DataProcessor/speech_enhancement_process/process_quality_assess",
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+            
+            if start_result.returncode == 0:
+                # 等待服务初始化
+                logger.info(f"GPU {self.gpu_id}: 等待服务初始化...")
+                time.sleep(20)
+                
+                # 测试服务是否恢复
+                if self._test_connection_quiet():
+                    logger.info(f"GPU {self.gpu_id}: LLM服务重启成功")
+                    return True
+                else:
+                    logger.error(f"GPU {self.gpu_id}: LLM服务重启后仍然不可用")
+                    return False
+            else:
+                logger.error(f"GPU {self.gpu_id}: LLM服务启动失败: {start_result.stderr}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"GPU {self.gpu_id}: 重启LLM服务时出错: {e}")
+            return False
+        finally:
+            # 释放锁
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+                os.remove(self.restart_lock_file)
+                logger.info(f"GPU {self.gpu_id}: 释放服务重启锁")
+            except:
+                pass
+    
+    def _test_connection_quiet(self) -> bool:
+        """静默测试连接（不打印日志）"""
+        try:
+            health_url = f"{self.service_url}/health"
+            response = self.session.get(health_url, timeout=10)
+            return response.status_code == 200
+        except:
+            return False
     
     def _test_connection(self):
         """测试与LLM服务的连接"""
@@ -304,71 +403,86 @@ class HTTPTextNormalizer:
             raise
     
     def normalize_text_pair(self, text1: str, text2: str) -> Tuple[str, str]:
-        """使用HTTP API标准化文本对"""
-        try:
-            # 准备请求数据
-            request_data = {
-                "text1": text1,
-                "text2": text2
-            }
-            
-            # 发送请求
-            normalize_url = f"{self.service_url}/normalize"
-            response = self.session.post(
-                normalize_url,
-                json=request_data,
-                timeout=self.timeout
-            )
-            
-            # 检查响应
-            response.raise_for_status()
-            result = response.json()
-            
-            # 提取结果
-            normalized_text1 = result.get("normalized_text1", "")
-            normalized_text2 = result.get("normalized_text2", "")
-            success = result.get("success", False)
-            error_message = result.get("error_message")
-            
-            if not success and error_message:
-                logger.warning(f"GPU {self.gpu_id}: LLM标准化失败: {error_message}")
-            
-            logger.info(f"GPU {self.gpu_id}: HTTP LLM标准化完成")
-            logger.info(f"GPU {self.gpu_id}: 原始文本1: '{text1}' -> 标准化: '{normalized_text1}'")
-            logger.info(f"GPU {self.gpu_id}: 原始文本2: '{text2}' -> 标准化: '{normalized_text2}'")
-            
-            return normalized_text1, normalized_text2
-            
-        except requests.exceptions.Timeout:
-            logger.error(f"GPU {self.gpu_id}: LLM服务请求超时")
-            return self.basic_normalize(text1), self.basic_normalize(text2)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"GPU {self.gpu_id}: LLM服务请求失败: {e}")
-            return self.basic_normalize(text1), self.basic_normalize(text2)
-        except Exception as e:
-            logger.error(f"GPU {self.gpu_id}: HTTP LLM标准化失败: {e}")
-            return self.basic_normalize(text1), self.basic_normalize(text2)
+        """使用HTTP API标准化文本对 - 带自动服务恢复功能"""
+        
+        for attempt in range(self.max_retries + 1):
+            try:
+                # 准备请求数据
+                request_data = {
+                    "text1": text1,
+                    "text2": text2
+                }
+                
+                # 发送请求
+                normalize_url = f"{self.service_url}/normalize"
+                response = self.session.post(
+                    normalize_url,
+                    json=request_data,
+                    timeout=self.timeout
+                )
+                
+                # 检查响应
+                response.raise_for_status()
+                result = response.json()
+                
+                # 提取结果
+                normalized_text1 = result.get("normalized_text1", "")
+                normalized_text2 = result.get("normalized_text2", "")
+                success = result.get("success", False)
+                error_message = result.get("error_message")
+                
+                if not success and error_message:
+                    logger.warning(f"GPU {self.gpu_id}: LLM标准化失败: {error_message}")
+                
+                logger.info(f"GPU {self.gpu_id}: HTTP LLM标准化完成")
+                logger.info(f"GPU {self.gpu_id}: 原始文本1: '{text1}' -> 标准化: '{normalized_text1}'")
+                logger.info(f"GPU {self.gpu_id}: 原始文本2: '{text2}' -> 标准化: '{normalized_text2}'")
+                
+                # 成功时重置重启计数器
+                self.service_restart_attempts = 0
+                return normalized_text1, normalized_text2
+                
+            except (requests.exceptions.ConnectionError, 
+                    requests.exceptions.Timeout, 
+                    requests.exceptions.RequestException) as e:
+                
+                logger.warning(f"GPU {self.gpu_id}: LLM服务连接失败 (尝试 {attempt + 1}/{self.max_retries + 1}): {e}")
+                
+                # 如果不是最后一次尝试
+                if attempt < self.max_retries:
+                    # 尝试重启服务（仅在前几次尝试时）
+                    if attempt == 0:
+                        logger.warning(f"GPU {self.gpu_id}: 检测到服务不可用，尝试自动恢复...")
+                        if self._restart_llm_service():
+                            logger.info(f"GPU {self.gpu_id}: 服务恢复成功，继续重试...")
+                            continue
+                        else:
+                            logger.error(f"GPU {self.gpu_id}: 服务恢复失败")
+                    
+                    # 等待后重试
+                    import time
+                    wait_time = (attempt + 1) * 2  # 递增等待时间
+                    logger.info(f"GPU {self.gpu_id}: 等待 {wait_time}秒后重试...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # 最后一次尝试失败
+                    logger.error(f"GPU {self.gpu_id}: 所有重试均失败，LLM服务不可用")
+                    raise RuntimeError(f"LLM服务不可用，已尝试 {self.max_retries + 1} 次")
+                    
+            except Exception as e:
+                logger.error(f"GPU {self.gpu_id}: HTTP LLM标准化失败: {e}")
+                if attempt < self.max_retries:
+                    import time
+                    time.sleep(2)
+                    continue
+                else:
+                    raise RuntimeError(f"HTTP LLM标准化失败: {e}")
+        
+        # 这里不应该到达，但以防万一
+        raise RuntimeError("未知错误：标准化过程意外结束")
     
-    def basic_normalize(self, text: str) -> str:
-        """基础文本标准化（降级方法）"""
-        import re
-        import string
-        
-        if not text:
-            return ""
-        
-        # 转换为小写
-        text = text.lower().strip()
-        
-        # 移除标点符号
-        punctuation = string.punctuation + '，。！？；：""''（）【】《》〈〉「」『』〖〗〔〕［］｛｝'
-        for p in punctuation:
-            text = text.replace(p, '')
-        
-        # 标准化空格
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        return text
+
 
 class KimiAudioProcessor:
     """Kimi-Audio处理器"""
@@ -431,13 +545,15 @@ class KimiAudioProcessor:
     
     def transcribe_audio(self, audio_path: str) -> str:
         """使用Kimi-Audio进行语音识别"""
+        # 初始化current_dir，确保在任何异常发生前都已定义
+        current_dir = os.getcwd()
+        
         try:
             # 确保模型已经加载
             if self.model is None:
                 self.load_model()
             
             # 切换到Kimi-Audio目录进行推理
-            current_dir = os.getcwd()
             if os.path.exists(self.kimi_audio_dir):
                 os.chdir(self.kimi_audio_dir)
                 
@@ -494,7 +610,15 @@ class KimiAudioProcessor:
             return ""
         finally:
             # 恢复原始工作目录
-            os.chdir(current_dir)
+            try:
+                os.chdir(current_dir)
+            except Exception as e:
+                logger.warning(f"GPU {self.gpu_id}: 恢复工作目录失败: {e}")
+                # 尝试恢复到原始工作目录
+                try:
+                    os.chdir(self.original_cwd)
+                except:
+                    pass
     
     def batch_transcribe(self, audio_files: List[str], desc: str = "转录音频") -> List[str]:
         """批量转录音频"""
@@ -513,7 +637,7 @@ class KimiAudioProcessor:
 class QualityAssessmentProcessor:
     """质量评估处理器"""
     
-    def __init__(self, config: Dict, dir_config: Dict, gpu_id: int = 0):
+    def __init__(self, config: Dict, dir_config: Dict, gpu_id: int = 0, llm_service_url: str = None):
         self.config = config
         self.dir_config = dir_config  # 当前目录配置
         self.gpu_id = gpu_id
@@ -533,17 +657,30 @@ class QualityAssessmentProcessor:
         # 初始化HTTP文本标准化器（如果启用）
         self.http_normalizer = None
         if config.get('use_llm_normalization', False) and config.get('text_normalization') == 'llm':
+            # 使用传入的LLM服务URL，如果没有则使用配置中的默认URL
+            service_url = llm_service_url or config.get('llm_service_url')
+            logger.info(f"GPU {gpu_id}: 初始化HTTP文本标准化器: {service_url}")
+            
+            if not service_url:
+                logger.error(f"GPU {gpu_id}: LLM服务URL未配置")
+                raise RuntimeError("LLM服务URL未配置")
+            
             try:
                 self.http_normalizer = HTTPTextNormalizer(
-                    service_url=config['llm_service_url'],
-                    timeout=config['llm_timeout'],
-                    max_retries=config['llm_max_retries'],
+                    service_url=service_url,
+                    timeout=config.get('llm_timeout', 30),
+                    max_retries=config.get('llm_max_retries', 3),
                     gpu_id=gpu_id
                 )
+                logger.info(f"GPU {gpu_id}: HTTP文本标准化器初始化成功")
             except Exception as e:
-                logger.warning(f"GPU {gpu_id}: 初始化HTTP文本标准化器失败: {e}")
-                logger.warning(f"GPU {gpu_id}: 将使用传统标准化方法")
-                self.http_normalizer = None
+                logger.error(f"GPU {gpu_id}: 初始化HTTP文本标准化器失败: {e}")
+                logger.error(f"GPU {gpu_id}: LLM服务不可用，程序无法继续运行")
+                raise RuntimeError(f"LLM服务不可用，程序无法继续运行: {e}")
+        else:
+            # 配置不要求使用LLM标准化
+            logger.error(f"GPU {gpu_id}: LLM标准化配置错误 - use_llm_normalization: {config.get('use_llm_normalization')}, text_normalization: {config.get('text_normalization')}")
+            raise RuntimeError("LLM标准化配置错误 - 请检查配置文件")
         
         # 统计信息
         self.stats = {
@@ -594,152 +731,11 @@ class QualityAssessmentProcessor:
             logger.error(f"保存音频失败 {output_path}: {e}")
             return False
     
-    def get_common_words(self) -> set:
-        """获取常见英文单词集合"""
-        # 常见的英文单词列表（可以根据需要扩展）
-        common_words = {
-            'the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have', 'i', 'it', 'for', 'not', 'on', 'with',
-            'he', 'as', 'you', 'do', 'at', 'this', 'but', 'his', 'by', 'from', 'they', 'she', 'or', 'an', 'will',
-            'my', 'one', 'all', 'would', 'there', 'their', 'what', 'so', 'up', 'out', 'if', 'about', 'who', 'get',
-            'which', 'go', 'me', 'when', 'make', 'can', 'like', 'time', 'no', 'just', 'him', 'know', 'take',
-            'people', 'into', 'year', 'your', 'good', 'some', 'could', 'them', 'see', 'other', 'than', 'then',
-            'now', 'look', 'only', 'come', 'its', 'over', 'think', 'also', 'back', 'after', 'use', 'two', 'how',
-            'our', 'work', 'first', 'well', 'way', 'even', 'new', 'want', 'because', 'any', 'these', 'give', 'day',
-            'most', 'us', 'is', 'was', 'are', 'been', 'has', 'had', 'were', 'said', 'each', 'which', 'their',
-            'said', 'she', 'use', 'how', 'many', 'oil', 'sit', 'set', 'run', 'eat', 'far', 'sea', 'eye', 'ago',
-            'off', 'far', 'set', 'own', 'under', 'last', 'right', 'move', 'thing', 'general', 'school', 'never',
-            'same', 'another', 'begin', 'while', 'number', 'part', 'turn', 'real', 'leave', 'might', 'great',
-            'little', 'world', 'public', 'read', 'such', 'where', 'much', 'family', 'long', 'both', 'leave',
-            'put', 'end', 'why', 'let', 'home', 'big', 'find', 'came', 'every', 'side', 'tried', 'told', 'men',
-            'women', 'child', 'children', 'got', 'life', 'called', 'need', 'may', 'ask', 'went', 'say', 'kind',
-            'must', 'house', 'picture', 'try', 'again', 'change', 'play', 'small', 'spell', 'move', 'live',
-            'place', 'sound', 'great', 'again', 'still', 'every', 'large', 'must', 'big', 'even', 'such', 'because',
-            'turn', 'here', 'why', 'ask', 'went', 'men', 'read', 'need', 'land', 'different', 'home', 'move',
-            'try', 'kind', 'hand', 'picture', 'again', 'change', 'off', 'play', 'spell', 'air', 'away', 'animal',
-            'house', 'point', 'page', 'letter', 'mother', 'answer', 'found', 'study', 'still', 'learn', 'should',
-            'america', 'world', 'high', 'every', 'near', 'add', 'food', 'between', 'own', 'below', 'country',
-            'plant', 'last', 'school', 'father', 'keep', 'tree', 'never', 'start', 'city', 'earth', 'eye', 'light',
-            'thought', 'head', 'under', 'story', 'saw', 'left', 'dont', 'few', 'while', 'along', 'might', 'close',
-            'something', 'seem', 'next', 'hard', 'open', 'example', 'begin', 'life', 'always', 'those', 'both',
-            'paper', 'together', 'got', 'group', 'often', 'run', 'important', 'until', 'children', 'side', 'feet',
-            'car', 'mile', 'night', 'walk', 'white', 'sea', 'began', 'grow', 'took', 'river', 'four', 'carry',
-            'state', 'once', 'book', 'hear', 'stop', 'without', 'second', 'later', 'miss', 'idea', 'enough', 'eat',
-            'face', 'watch', 'far', 'indian', 'really', 'almost', 'let', 'above', 'girl', 'sometimes', 'mountain',
-            'cut', 'young', 'talk', 'soon', 'list', 'song', 'being', 'leave', 'family', 'its'
-        }
-        return common_words
+
     
-    def normalize_text(self, text: str) -> str:
-        """文本标准化，处理标点、空格、连词等问题"""
-        import re
-        import string
-        
-        if not text:
-            return ""
-        
-        # 根据配置选择标准化级别
-        normalization_level = self.config.get('text_normalization', 'advanced')
-        
-        if normalization_level == 'basic':
-            # 基础标准化：处理大小写、标点符号和多余空格
-            text = text.lower().strip()
-            
-            # 移除标点符号（如果启用）
-            if self.config.get('remove_punctuation', True):
-                # 包括中文标点符号
-                punctuation = string.punctuation + '，。！？；：""''（）【】《》〈〉「」『』〖〗〔〕［］｛｝'
-                for p in punctuation:
-                    text = text.replace(p, '')
-                
-                # 处理特殊字符和符号
-                text = re.sub(r'[^\w\s]', '', text)
-            
-            # 标准化空格
-            text = re.sub(r'\s+', ' ', text).strip()
-            return text
-        
-        # 转换为小写
-        text = text.lower().strip()
-        
-        # 移除标点符号（如果启用）
-        if self.config.get('remove_punctuation', True):
-            # 包括中文标点符号
-            punctuation = string.punctuation + '，。！？；：""''（）【】《》〈〉「」『』〖〗〔〕［］｛｝'
-            for p in punctuation:
-                text = text.replace(p, '')
-            
-            # 处理特殊字符和符号
-            text = re.sub(r'[^\w\s]', '', text)
-        
-        # 统一空格处理（如果启用）
-        if self.config.get('normalize_spacing', True):
-            # 将多个空格替换为单个空格
-            text = re.sub(r'\s+', ' ', text)
-        
-        # 处理拼读问题（如果启用）
-        if self.config.get('handle_spelling', True) and normalization_level == 'advanced':
-            text = self._handle_spelling_normalization(text)
-        
-        # 最终清理空格
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        return text
+
     
-    def _handle_spelling_normalization(self, text: str) -> str:
-        """处理拼读标准化"""
-        import re
-        
-        # 获取常见单词集合
-        common_words = self.get_common_words() if self.config.get('preserve_common_words', True) else set()
-        max_length = self.config.get('spelling_max_length', 4)
-        
-        # 先处理明显的拼读模式（单个字符用空格分隔）
-        # 匹配单个字符后跟空格的模式，这通常是拼读
-        if re.search(r'\b[a-z]\s+[a-z]\b', text):
-            # 这看起来已经是拼读模式，保持原样
-            return text
-        
-        # 尝试识别可能的拼读模式
-        words = text.split()
-        processed_words = []
-        
-        for word in words:
-            # 如果单词长度>1且全是字母或数字，可能需要拆分
-            if len(word) > 1 and (word.isalpha() or word.isdigit()):
-                should_split = False
-                
-                if word.isdigit():
-                    # 数字序列，如果长度在合理范围内就拆分
-                    if len(word) <= max_length:
-                        should_split = True
-                elif word.isalpha():
-                    # 字母序列
-                    if word.lower() in common_words:
-                        # 是常见单词，不拆分
-                        should_split = False
-                    elif len(word) <= max_length:
-                        # 短字母序列，可能是拼读
-                        # 额外检查：如果包含元音且长度>2，可能是正常单词
-                        if len(word) > 2 and any(vowel in word for vowel in 'aeiou'):
-                            # 进一步检查是否符合英文单词的常见模式
-                            # 简单规则：如果元音和辅音交替出现，可能是正常单词
-                            vowels = 'aeiou'
-                            vowel_pattern = sum(1 for c in word if c in vowels)
-                            if vowel_pattern >= len(word) // 3:  # 至少1/3是元音
-                                should_split = False
-                            else:
-                                should_split = True
-                        else:
-                            should_split = True
-                
-                if should_split:
-                    processed_words.append(' '.join(word))
-                else:
-                    processed_words.append(word)
-            else:
-                processed_words.append(word)
-        
-        return ' '.join(processed_words)
+
     
     def calculate_wer_cer(self, reference: str, hypothesis: str) -> Tuple[float, float]:
         """计算WER和CER（文本应该已经标准化）"""
@@ -783,13 +779,8 @@ class QualityAssessmentProcessor:
             'error_message': '',
             'timestamp': datetime.now().isoformat(),
             'text_normalization_config': {
-                'level': self.config.get('text_normalization', 'llm'),
-                'remove_punctuation': self.config.get('remove_punctuation', True),
-                'normalize_spacing': self.config.get('normalize_spacing', True),
-                'handle_spelling': self.config.get('handle_spelling', True),
-                'spelling_max_length': self.config.get('spelling_max_length', 4),
-                'preserve_common_words': self.config.get('preserve_common_words', True),
-                'use_llm_normalization': self.config.get('use_llm_normalization', False),
+                'method': 'llm_only',
+                'use_llm_normalization': self.config.get('use_llm_normalization', True),
                 'llm_service_url': self.config.get('llm_service_url', ''),
                 'llm_enabled': self.http_normalizer is not None
             },
@@ -882,8 +873,8 @@ class QualityAssessmentProcessor:
                     result['original_transcription_normalized'] = original_transcription
                     result['enhanced_transcription_normalized'] = enhanced_transcription
                     
-                    # 进行文本标准化
-                    if self.http_normalizer is not None and self.config.get('text_normalization') == 'llm':
+                    # 进行文本标准化 - 只使用LLM（必须成功）
+                    if self.http_normalizer is not None:
                         # 使用HTTP LLM标准化
                         logger.info(f"GPU {self.gpu_id}: 使用HTTP LLM进行文本标准化")
                         normalized_original, normalized_enhanced = self.http_normalizer.normalize_text_pair(
@@ -891,12 +882,11 @@ class QualityAssessmentProcessor:
                         )
                         result['original_transcription_normalized'] = normalized_original
                         result['enhanced_transcription_normalized'] = normalized_enhanced
+                        logger.info(f"GPU {self.gpu_id}: LLM文本标准化成功")
                     else:
-                        # 使用传统标准化
-                        normalized_original = self.normalize_text(original_transcription)
-                        normalized_enhanced = self.normalize_text(enhanced_transcription)
-                        result['original_transcription_normalized'] = normalized_original
-                        result['enhanced_transcription_normalized'] = normalized_enhanced
+                        # LLM服务未初始化，这不应该发生
+                        logger.error(f"GPU {self.gpu_id}: LLM服务未初始化，无法进行文本标准化")
+                        raise RuntimeError("LLM服务未初始化，无法进行文本标准化")
                     
                     # 计算WER和CER（使用标准化后的文本）
                     if normalized_original and normalized_enhanced:
@@ -1029,6 +1019,60 @@ class QualityAssessmentProcessor:
         logger.info(f"GPU {self.gpu_id}: 文本结果已保存到: {text_result_file}")
 
 
+def detect_gpu_config():
+    """检测GPU配置并返回合适的配置方案"""
+    available_gpus = torch.cuda.device_count()
+    
+    if available_gpus == 4:
+        # 4卡配置：GPU 0 用于LLM，GPU 1,2,3 用于ASR
+        return {
+            'gpu_groups': [
+                {
+                    'llm_gpu': 0,
+                    'asr_gpus': [1, 2, 3],
+                    'llm_service_url': 'http://localhost:8000',
+                    'group_id': 0
+                }
+            ],
+            'total_asr_gpus': 3,
+            'description': f"4卡配置：GPU 0(LLM服务) + GPU 1,2,3(ASR)"
+        }
+    elif available_gpus == 8:
+        # 8卡配置：分成两组，每组4卡
+        return {
+            'gpu_groups': [
+                {
+                    'llm_gpu': 0,
+                    'asr_gpus': [1, 2, 3],
+                    'llm_service_url': 'http://localhost:8000',
+                    'group_id': 0
+                },
+                {
+                    'llm_gpu': 4,
+                    'asr_gpus': [5, 6, 7],
+                    'llm_service_url': 'http://localhost:8001',
+                    'group_id': 1
+                }
+            ],
+            'total_asr_gpus': 6,
+            'description': f"8卡配置：组1[GPU 0(LLM) + GPU 1,2,3(ASR)] + 组2[GPU 4(LLM) + GPU 5,6,7(ASR)]"
+        }
+    else:
+        # 其他配置，使用原有逻辑
+        logger.warning(f"检测到{available_gpus}张GPU，使用传统配置模式")
+        return {
+            'gpu_groups': [
+                {
+                    'llm_gpu': 0,
+                    'asr_gpus': list(range(1, min(available_gpus, 4))),
+                    'llm_service_url': 'http://localhost:8000',
+                    'group_id': 0
+                }
+            ],
+            'total_asr_gpus': min(available_gpus - 1, 3),
+            'description': f"{available_gpus}卡传统配置：GPU 0(LLM服务) + GPU 1-{min(available_gpus-1, 3)}(ASR)"
+        }
+
 def split_audio_pairs(audio_pairs: List[Tuple[str, str]], num_splits: int) -> List[List[Tuple[str, str]]]:
     """将音频对列表分成多个子集"""
     total_pairs = len(audio_pairs)
@@ -1048,9 +1092,31 @@ def split_audio_pairs(audio_pairs: List[Tuple[str, str]], num_splits: int) -> Li
     
     return splits
 
+def split_audio_pairs_for_groups(audio_pairs: List[Tuple[str, str]], gpu_groups: List[Dict]) -> List[List[Tuple[str, str]]]:
+    """根据GPU组配置将音频对分成对应的组"""
+    num_groups = len(gpu_groups)
+    if num_groups == 1:
+        # 单组情况，按ASR GPU数量分割
+        return split_audio_pairs(audio_pairs, len(gpu_groups[0]['asr_gpus']))
+    
+    # 多组情况，先按组分割，再在组内按ASR GPU分割
+    group_splits = split_audio_pairs(audio_pairs, num_groups)
+    
+    all_splits = []
+    for group_idx, (group_data, gpu_group) in enumerate(zip(group_splits, gpu_groups)):
+        # 在每个组内按ASR GPU数量进一步分割
+        asr_gpu_count = len(gpu_group['asr_gpus'])
+        if asr_gpu_count > 1:
+            group_sub_splits = split_audio_pairs(group_data, asr_gpu_count)
+            all_splits.extend(group_sub_splits)
+        else:
+            all_splits.append(group_data)
+    
+    return all_splits
+
 def process_gpu_subset(args_tuple):
     """处理单个GPU子集的函数"""
-    gpu_id, audio_pairs_subset, config, dir_config, subset_id = args_tuple
+    gpu_id, audio_pairs_subset, config, dir_config, subset_id, llm_service_url = args_tuple
     
     try:
         # 设置进程的GPU环境变量
@@ -1060,9 +1126,9 @@ def process_gpu_subset(args_tuple):
         import torch
         if torch.cuda.is_available():
             torch.cuda.set_device(0)  # 因为CUDA_VISIBLE_DEVICES已经设置，所以这里用0
-            
-        # 创建处理器
-        processor = QualityAssessmentProcessor(config, dir_config, gpu_id)
+        
+        # 创建处理器，传入对应的LLM服务URL
+        processor = QualityAssessmentProcessor(config, dir_config, gpu_id, llm_service_url)
         
         # 处理子集
         results = processor.run_assessment_subset(audio_pairs_subset, subset_id)
@@ -1293,6 +1359,12 @@ def get_audio_pairs(dir_config: Dict) -> List[Tuple[str, str]]:
     
     return audio_pairs
 
+# 函数已删除 - 重复功能已合并到detect_gpu_config中
+
+# 函数已删除 - 功能已由split_audio_pairs_for_groups替代
+
+# 函数已删除 - LLM服务启动现在由外部脚本管理
+
 def main():
     """主函数"""
     # 设置multiprocessing启动方法为spawn（用于CUDA兼容性）
@@ -1358,25 +1430,7 @@ def main():
     parser.add_argument("--gpu_ids", type=int, nargs='+',
                        default=CONFIG['gpu_ids'],
                        help="GPU ID列表（建议使用 1,2,3，GPU 0留给LLM服务）")
-    parser.add_argument("--text_normalization", type=str,
-                       default=CONFIG['text_normalization'],
-                       choices=['basic', 'advanced', 'llm'],
-                       help="文本标准化级别")
-    parser.add_argument("--remove_punctuation", action="store_true",
-                       default=CONFIG['remove_punctuation'],
-                       help="移除标点符号")
-    parser.add_argument("--normalize_spacing", action="store_true",
-                       default=CONFIG['normalize_spacing'],
-                       help="标准化空格")
-    parser.add_argument("--handle_spelling", action="store_true",
-                       default=CONFIG['handle_spelling'],
-                       help="处理拼读问题")
-    parser.add_argument("--spelling_max_length", type=int,
-                       default=CONFIG['spelling_max_length'],
-                       help="拼读检测的最大长度")
-    parser.add_argument("--preserve_common_words", action="store_true",
-                       default=CONFIG['preserve_common_words'],
-                       help="保留常见单词不拆分")
+
     parser.add_argument("--llm_service_url", type=str,
                        default=CONFIG['llm_service_url'],
                        help="LLM服务URL")
@@ -1469,23 +1523,38 @@ def main():
     # 更新全局配置
     global_config_keys = ['kimi_model_path', 'kimi_audio_dir', 'skip_existing', 
                          'max_audio_length', 'ten_vad_hop_size', 'ten_vad_threshold',
-                         'num_gpus', 'gpu_ids', 'text_normalization', 'remove_punctuation',
-                         'normalize_spacing', 'handle_spelling', 'spelling_max_length',
-                         'preserve_common_words', 'llm_service_url', 'llm_timeout',
+                         'num_gpus', 'gpu_ids', 'llm_service_url', 'llm_timeout',
                          'llm_max_retries', 'use_llm_normalization']
     
     for key in global_config_keys:
         if hasattr(args, key) and getattr(args, key) is not None:
             CONFIG[key] = getattr(args, key)
     
-    # 确保GPU数量和ID列表一致
+    # 确保GPU数量和ID列表一致（向后兼容）
     if len(CONFIG['gpu_ids']) != CONFIG['num_gpus']:
         CONFIG['gpu_ids'] = list(range(1, CONFIG['num_gpus'] + 1))  # 默认使用GPU 1,2,3...
     
+    # 自动检测GPU配置
+    gpu_config = detect_gpu_config()
+    logger.info(f"GPU配置检测结果: {gpu_config['description']}")
+    
+    # 更新CONFIG中的GPU相关配置
+    CONFIG['gpu_groups'] = gpu_config['gpu_groups']
+    CONFIG['num_gpus'] = gpu_config['total_asr_gpus']
+    CONFIG['gpu_ids'] = []
+    for group in gpu_config['gpu_groups']:
+        CONFIG['gpu_ids'].extend(group['asr_gpus'])
+    
     # 打印配置信息
-    print("音频质量评估脚本 (多GPU并行版本 - 支持多目录处理)")
+    print("音频质量评估脚本 (多GPU并行版本 - 自适应GPU配置)")
     print("=" * 80)
-    print(f"目录配置数量: {len(CONFIG['directory_configs'])}")
+    print(f"GPU配置:")
+    for group in CONFIG['gpu_groups']:
+        print(f"  组 {group['group_id']}: LLM GPU {group['llm_gpu']}, ASR GPUs {group['asr_gpus']}")
+        print(f"    LLM服务: {group['llm_service_url']}")
+    print(f"总ASR GPU数量: {CONFIG['num_gpus']}")
+    
+    print(f"\n目录配置数量: {len(CONFIG['directory_configs'])}")
     for i, dir_config in enumerate(CONFIG['directory_configs']):
         print(f"\n目录配置 {i+1}: {dir_config['name']}")
         print(f"  原始音频目录: {dir_config['original_dir']}")
@@ -1498,9 +1567,7 @@ def main():
     print(f"\n全局配置:")
     print(f"Kimi-Audio模型: {CONFIG['kimi_model_path']}")
     print(f"Kimi-Audio目录: {CONFIG['kimi_audio_dir']}")
-    print(f"GPU配置: GPU 0 (LLM服务), GPU {CONFIG['gpu_ids']} (ASR)")
-    print(f"ASR GPU数量: {CONFIG['num_gpus']}")
-    print(f"文本标准化级别: {CONFIG['text_normalization']}")
+    print(f"文本标准化方式: 仅使用LLM")
     print(f"TEN VAD配置: hop_size={CONFIG['ten_vad_hop_size']}, threshold={CONFIG['ten_vad_threshold']}")
     print(f"跳过已存在: {CONFIG['skip_existing']}")
     print(f"最大音频长度: {CONFIG['max_audio_length']} 秒")
@@ -1520,25 +1587,32 @@ def main():
         logger.error("CUDA不可用，无法使用GPU")
         return
     
-    available_gpus = torch.cuda.device_count()
-    max_required_gpu = max(CONFIG['gpu_ids']) if CONFIG['gpu_ids'] else 0
-    if available_gpus <= max_required_gpu:
-        logger.error(f"可用GPU数量({available_gpus})不足，需要GPU {max_required_gpu}")
-        return
-    
     # 检查LLM服务连接（如果启用）
     if CONFIG.get('use_llm_normalization', False) and CONFIG.get('text_normalization') == 'llm':
-        try:
-            import requests
-            session = requests.Session()
-            session.proxies = {'http': None, 'https': None}
-            
-            health_url = f"{CONFIG['llm_service_url']}/health"
-            response = session.get(health_url, timeout=10)
-            response.raise_for_status()
-            print(f"✓ LLM服务连接正常: {CONFIG['llm_service_url']}")
-        except Exception as e:
-            logger.error(f"LLM服务连接失败: {e}")
+        import requests
+        session = requests.Session()
+        session.proxies = {'http': None, 'https': None}
+        
+        # 检查LLM服务（支持多个端口）
+        llm_urls = ['http://localhost:8000', 'http://localhost:8001']
+        connected_services = 0
+        
+        for url in llm_urls:
+            try:
+                health_url = f"{url}/health"
+                response = session.get(health_url, timeout=5)
+                response.raise_for_status()
+                print(f"✓ LLM服务连接正常: {url}")
+                connected_services += 1
+            except Exception as e:
+                # 对于8001端口，如果是4卡配置可能不存在，这是正常的
+                if '8001' in url:
+                    logger.debug(f"LLM服务 {url} 不可用（可能是4卡配置）: {e}")
+                else:
+                    logger.error(f"LLM服务连接失败 {url}: {e}")
+        
+        if connected_services == 0:
+            logger.error("没有可用的LLM服务，请先启动LLM服务：./auto_start_llm_services.sh")
             return
     
     # 处理每个目录配置
@@ -1573,17 +1647,27 @@ def main():
             
             logger.info(f"找到 {len(audio_pairs)} 个音频对")
             
-            # 分割音频对
-            logger.info(f"将音频对分成 {CONFIG['num_gpus']} 个子集...")
-            audio_pairs_splits = split_audio_pairs(audio_pairs, CONFIG['num_gpus'])
+            # 根据GPU组配置分割音频对
+            gpu_groups = CONFIG['gpu_groups']
+            logger.info(f"将音频对分配给 {len(gpu_groups)} 个GPU组，总共 {CONFIG['num_gpus']} 个ASR GPU...")
+            audio_pairs_splits = split_audio_pairs_for_groups(audio_pairs, gpu_groups)
             
             # 准备多进程参数
             process_args = []
-            for i, (gpu_id, audio_pairs_subset) in enumerate(zip(CONFIG['gpu_ids'], audio_pairs_splits)):
-                process_args.append((gpu_id, audio_pairs_subset, CONFIG, dir_config, i))
+            split_idx = 0
+            
+            for group in gpu_groups:
+                for asr_gpu in group['asr_gpus']:
+                    if split_idx < len(audio_pairs_splits):
+                        audio_pairs_subset = audio_pairs_splits[split_idx]
+                        llm_service_url = group['llm_service_url']
+                        process_args.append((asr_gpu, audio_pairs_subset, CONFIG, dir_config, split_idx, llm_service_url))
+                        split_idx += 1
             
             # 启动多进程处理
             logger.info(f"启动多GPU并行处理: {dir_config['name']}")
+            gpu_config_info = [f"组{g['group_id']}(LLM: GPU{g['llm_gpu']}, ASR: GPU{g['asr_gpus']})" for g in gpu_groups]
+            logger.info(f"GPU组配置: {gpu_config_info}")
             start_time = time.time()
             
             with ProcessPoolExecutor(max_workers=CONFIG['num_gpus']) as executor:
@@ -1605,7 +1689,7 @@ def main():
             logger.info(f"目录 {dir_config['name']} 处理完成，耗时: {processing_time:.2f} 秒")
             
             # 合并结果
-            dir_results = merge_results(dir_config['output_dir'], CONFIG['num_gpus'], CONFIG, dir_config)
+            dir_results = merge_results(dir_config['output_dir'], len(process_args), CONFIG, dir_config)
             all_directory_results.extend(dir_results)
             
         except Exception as e:

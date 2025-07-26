@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 LLM服务脚本
-使用Ollama部署Qwen3-8B模型
+使用Ollama部署Qwen2.5-32B模型
 提供HTTP API接口用于文本标准化
 """
 
@@ -47,7 +47,7 @@ class TextNormalizationResponse(BaseModel):
 class OllamaLLMService:
     """Ollama LLM服务类"""
     
-    def __init__(self, model_name: str = "qwen3:8b", ollama_host: str = "localhost:11434"):
+    def __init__(self, model_name: str = "qwen2.5:32b", ollama_host: str = "localhost:11434"):
         """
         初始化Ollama LLM服务
         
@@ -169,13 +169,8 @@ class OllamaLLMService:
         """
         # 检查Ollama客户端是否可用
         if self.client is None:
-            logger.warning(f"Ollama客户端不可用，使用基础标准化方法")
-            return {
-                "normalized_text1": self._basic_normalize(text1),
-                "normalized_text2": self._basic_normalize(text2),
-                "success": False,
-                "error_message": "Ollama服务不可用，使用基础标准化方法"
-            }
+            logger.error(f"Ollama客户端不可用，无法进行LLM文本标准化")
+            raise RuntimeError("Ollama服务不可用，无法进行LLM文本标准化")
         
         try:
             # 构造提示词
@@ -215,34 +210,84 @@ class OllamaLLMService:
             
         except Exception as e:
             logger.error(f"Ollama文本标准化失败: {e}")
-            # 降级到基础标准化
-            return {
-                "normalized_text1": self._basic_normalize(text1),
-                "normalized_text2": self._basic_normalize(text2),
-                "success": False,
-                "error_message": f"Ollama处理失败: {str(e)}"
-            }
+            # 只使用LLM，失败时直接返回错误
+            raise RuntimeError(f"LLM文本标准化失败: {str(e)}")
     
     def _build_normalization_prompt(self, text1: str, text2: str) -> str:
         """构造标准化提示词"""
-        prompt = f"""你是一个专业的文本标准化专家。请将以下两段文本标准化为相同的格式，以便进行准确的比较。
+        prompt = f"""你是语音识别文本标准化专家。请将两段文本标准化为统一格式，用于WER/CER计算。
 
-标准化规则：
-1. 统一大小写（全部转为小写）
-2. 移除标点符号
-3. 标准化空格（多个空格合并为单个空格）
-4. 处理拼读问题：如果一个文本是字母拼读形式（如"a b c"），另一个是连写形式（如"abc"），请将连写形式也转换为拼读形式（"abc" -> "a b c"）
-5. 保持语义内容完全一致
-6. 如果文本中包含数字，请将数字转换为拼读形式（如"123" -> "one two three"）
+# 核心原则
+- 只做格式标准化，不改变语义内容
+- 保持原文的语言错误（如同音词误用）
+- 两个文本必须使用完全相同的标准化规则
 
+# 标准化规则
+
+## 英语标准化：
+**基础处理**:
+- 转小写: "Hello" → "hello"
+- 去标点: "Hello!" → "hello" 
+- 去连字符: "twenty-one" → "twenty one"
+
+**缩写展开**:
+- "don't" → "do not"
+- "I'm" → "i am" 
+- "can't" → "cannot"
+- "won't" → "will not"
+- "it's" → "it is" (永远展开为"it is"，不是"its")
+
+**数字转换**:
+- 单独数字: "3" → "three"
+- 连续数字: "123" → "one hundred twenty three"
+- 年份: "2023" → "two thousand twenty three"
+
+**字母拼读统一规则** (重要):
+- 检查两个文本中是否有字母序列
+- 如果一个是拼读形式(如"a b c")，另一个是连写(如"abc")
+- 统一转换为拼读形式: "abc" → "a b c"
+- 示例: "My name is ABC" + "my name is a b c" → 都变成 "my name is a b c"
+
+## 中文标准化：
+- 去标点: "你好！" → "你好"
+- 去空格: "你 好" → "你好" 
+- 繁转简: "這個" → "这个"
+- 数字转换: "3个" → "三个", "2023年" → "二零二三年"
+- **同音词保持原样**: "在家"保持"在家", "再家"保持"再家" (不纠错)
+
+# 处理步骤示例
+
+输入: "My name is A B C." + "my name is abc"
+步骤:
+1. 基础标准化: "my name is a b c" + "my name is abc"  
+2. 检测拼读模式: 第一个已是拼读，第二个是连写
+3. 统一为拼读: "my name is a b c" + "my name is a b c"
+
+输入: "我在家里。" + "我再家里"
+步骤:
+1. 去标点: "我在家里" + "我再家里"
+2. 保持同音词原样: "我在家里" + "我再家里" (不改变"再")
+
+输入: "Hello, it's ok!" + "hello it is okay"  
+步骤:
+1. 基础处理: "hello its ok" + "hello it is okay"
+2. 缩写展开: "hello it is ok" + "hello it is okay"  
+3. 注意"it's"必须展开为"it is"
+
+---
+
+待处理文本:
 文本1: "{text1}"
 文本2: "{text2}"
 
-重要要求：减少思考时间，直接返回标准化后的结果！
+按规则处理后直接返回，注意格式：
 
-请直接返回标准化后的结果，格式如下：
-标准化文本1: [标准化后的文本1]
-标准化文本2: [标准化后的文本2]"""
+标准化文本1: 处理结果
+标准化文本2: 处理结果
+
+重要：
+- 只返回处理后的纯文本，不要加引号、方括号等任何标记
+- 确保两个文本使用完全相同的处理规则"""
         
         return prompt
     
@@ -255,7 +300,7 @@ class OllamaLLMService:
             
             # 查找标准化文本的模式，支持多种格式
             patterns = [
-                # 标准格式
+                # 标准格式（主要格式）
                 (r'标准化文本1[:：]\s*(.+?)(?=\n标准化文本2|标准化文本2|$)', r'标准化文本2[:：]\s*(.+?)(?=\n|$)'),
                 # 方括号格式
                 (r'标准化文本1[:：]\s*\[(.+?)\]', r'标准化文本2[:：]\s*\[(.+?)\]'),
@@ -263,6 +308,12 @@ class OllamaLLMService:
                 (r'文本1[:：]\s*(.+?)(?=\n文本2|文本2|$)', r'文本2[:：]\s*(.+?)(?=\n|$)'),
                 # 编号格式
                 (r'1\.\s*(.+?)(?=\n2\.|2\.|$)', r'2\.\s*(.+?)(?=\n|$)'),
+                # 英文格式
+                (r'Normalized Text 1[:：]\s*(.+?)(?=\nNormalized Text 2|Normalized Text 2|$)', 
+                 r'Normalized Text 2[:：]\s*(.+?)(?=\n|$)'),
+                # 混合格式（处理多行响应）
+                (r'(?:标准化文本1|Text 1)[:：]\s*(.+?)(?=\n(?:标准化文本2|Text 2)|(?:标准化文本2|Text 2)|$)', 
+                 r'(?:标准化文本2|Text 2)[:：]\s*(.+?)(?=\n|$)'),
             ]
             
             for pattern1, pattern2 in patterns:
@@ -273,9 +324,9 @@ class OllamaLLMService:
                     norm_text1 = match1.group(1).strip()
                     norm_text2 = match2.group(1).strip()
                     
-                    # 清理可能的方括号和其他标记
-                    norm_text1 = re.sub(r'^\[|]$', '', norm_text1).strip()
-                    norm_text2 = re.sub(r'^\[|]$', '', norm_text2).strip()
+                    # 清理各种可能的标记和格式
+                    norm_text1 = re.sub(r'^\[|]$|^"|"$|^\'|\'$', '', norm_text1).strip()
+                    norm_text2 = re.sub(r'^\[|]$|^"|"$|^\'|\'$', '', norm_text2).strip()
                     
                     # 验证提取的文本是否有效
                     if norm_text1 and norm_text2:
@@ -299,33 +350,14 @@ class OllamaLLMService:
                 logger.info(f"使用简化提取方法成功")
                 return extracted_texts[0], extracted_texts[1]
             
-            logger.warning(f"无法从Ollama响应中提取标准化文本，使用基础方法")
-            return self._basic_normalize(original_text1), self._basic_normalize(original_text2)
+            logger.error(f"无法从Ollama响应中提取标准化文本")
+            raise RuntimeError("LLM响应格式无法解析")
                 
         except Exception as e:
             logger.error(f"提取标准化文本失败: {e}")
-            return self._basic_normalize(original_text1), self._basic_normalize(original_text2)
+            raise RuntimeError(f"LLM响应解析失败: {str(e)}")
     
-    def _basic_normalize(self, text: str) -> str:
-        """基础文本标准化（降级方法）"""
-        import re
-        import string
-        
-        if not text:
-            return ""
-        
-        # 转换为小写
-        text = text.lower().strip()
-        
-        # 移除标点符号
-        punctuation = string.punctuation + '，。！？；：""''（）【】《》〈〉「」『』〖〗〔〕［］｛｝'
-        for p in punctuation:
-            text = text.replace(p, '')
-        
-        # 标准化空格
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        return text
+
 
 # 全局LLM服务实例
 llm_service = None
@@ -337,7 +369,7 @@ async def lifespan(app):
     # 启动时初始化
     try:
         # 从环境变量获取配置
-        model_name = os.getenv("LLM_MODEL_NAME", "qwen3:8b")
+        model_name = os.getenv("LLM_MODEL_NAME", "qwen2.5:32b")
         ollama_host = os.getenv("OLLAMA_HOST", "localhost:11434")
         
         llm_service = OllamaLLMService(
@@ -363,7 +395,7 @@ async def lifespan(app):
 # 创建FastAPI应用
 app = FastAPI(
     title="LLM文本标准化服务", 
-    description="使用Ollama Qwen3-8B进行文本标准化",
+    description="使用Ollama Qwen2.5-32B进行文本标准化",
     lifespan=lifespan
 )
 
@@ -425,7 +457,7 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="LLM文本标准化服务 (Ollama)")
     parser.add_argument("--model_name", type=str, 
-                       default="qwen3:8b",
+                       default="qwen2.5:32b",
                        help="Ollama模型名称")
     parser.add_argument("--ollama_host", type=str, default="localhost:11434",
                        help="Ollama服务地址")
