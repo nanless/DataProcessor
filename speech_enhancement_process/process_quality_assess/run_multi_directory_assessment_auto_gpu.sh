@@ -96,7 +96,7 @@ for port in 8000 8001; do
     for attempt in 1 2 3; do
         echo -e "${YELLOW}检查LLM服务(端口$port) - 第${attempt}次尝试...${NC}"
         
-        if curl -s -f --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
+        if http_proxy="" https_proxy="" curl -s -f --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
             echo -e "${GREEN}✓ LLM服务(端口$port)健康检查通过${NC}"
             service_ok=true
             break

@@ -31,12 +31,28 @@
       "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/Chinese_English_Scripted_Speech_Corpus_Children_mossformer_enhanced_quality_assessment",
       "volume_matching": false,
       "volume_matching_method": "ten_vad_energy"
+    },
+    {
+      "name": "speechocean762_zipenhancer",
+      "original_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762",
+      "enhanced_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762_zipenhancer_enhanced",
+      "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762_zipenhancer_enhanced_quality_assessment",
+      "volume_matching": true,
+      "volume_matching_method": "ten_vad_energy"
+    },
+    {
+      "name": "speechocean762_mossformer",
+      "original_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762",
+      "enhanced_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762_mossformer_enhanced",
+      "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762_mossformer_enhanced_quality_assessment",
+      "volume_matching": false,
+      "volume_matching_method": "ten_vad_energy"
     }
   ],
   "kimi_model_path": "/root/data/pretrained_models/Kimi-Audio-7B-Instruct",
   "kimi_audio_dir": "/root/code/github_repos/Kimi-Audio",
   "target_sr": 16000,
-  "skip_existing": false,
+  "skip_existing": true,
   "max_audio_length": 600,
   "ten_vad_hop_size": 256,
   "ten_vad_threshold": 0.5,

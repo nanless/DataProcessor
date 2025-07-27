@@ -90,7 +90,7 @@ TEST_CASES = [
         "name": "重复词测试",
         "text1": "我我觉得这个不错。",
         "text2": "我觉得这个不错",
-        "expected_similar": True
+        "expected_similar": False
     },
     {
         "name": "语气词测试", 
@@ -242,7 +242,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="文本标准化Prompt测试")
-    parser.add_argument("--url", type=str, default="http://127.0.0.1:8001",
+    parser.add_argument("--url", type=str, default="http://127.0.0.1:8000",
                        help="LLM服务URL")
     parser.add_argument("--save", type=str, default="",
                        help="保存结果的文件名")

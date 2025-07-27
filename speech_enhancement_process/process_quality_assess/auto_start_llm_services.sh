@@ -133,7 +133,7 @@ echo -e "${BLUE}检查服务状态:${NC}"
 
 if [ "$GPU_COUNT" -eq 4 ]; then
     # 检查4卡配置的服务
-    if curl -s http://localhost:8000/health > /dev/null; then
+    if http_proxy="" https_proxy="" curl -s http://localhost:8000/health > /dev/null; then
         echo -e "${GREEN}✓ LLM服务 (端口 8000) 正常运行${NC}"
     else
         echo -e "${RED}✗ LLM服务 (端口 8000) 连接失败${NC}"
@@ -141,13 +141,13 @@ if [ "$GPU_COUNT" -eq 4 ]; then
     
 elif [ "$GPU_COUNT" -eq 8 ]; then
     # 检查8卡配置的服务
-    if curl -s http://localhost:8000/health > /dev/null; then
+    if http_proxy="" https_proxy="" curl -s http://localhost:8000/health > /dev/null; then
         echo -e "${GREEN}✓ 组1 LLM服务 (端口 8000) 正常运行${NC}"
     else
         echo -e "${RED}✗ 组1 LLM服务 (端口 8000) 连接失败${NC}"
     fi
     
-    if curl -s http://localhost:8001/health > /dev/null; then
+    if http_proxy="" https_proxy="" curl -s http://localhost:8001/health > /dev/null; then
         echo -e "${GREEN}✓ 组2 LLM服务 (端口 8001) 正常运行${NC}"
     else
         echo -e "${RED}✗ 组2 LLM服务 (端口 8001) 连接失败${NC}"
