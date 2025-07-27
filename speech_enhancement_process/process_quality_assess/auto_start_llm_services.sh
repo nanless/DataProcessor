@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 自动启动LLM服务脚本
-# 根据GPU数量自动配置和启动相应的LLM服务
+# 根据GPU数量和模型类型自动配置和启动相应的LLM服务
 
 # 颜色定义
 RED='\033[0;31m'
@@ -10,9 +10,48 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# 默认配置
+DEFAULT_MODEL_NAME="qwen3:32b"
+DEFAULT_MODEL_TYPE="qwen3"
+
+# 解析命令行参数
+MODEL_NAME="$DEFAULT_MODEL_NAME"
+MODEL_TYPE="$DEFAULT_MODEL_TYPE"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --model-name)
+            MODEL_NAME="$2"
+            shift 2
+            ;;
+        --model-type)
+            MODEL_TYPE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "用法: $0 [选项]"
+            echo "选项:"
+            echo "  --model-name    LLM模型名称 (默认: $DEFAULT_MODEL_NAME)"
+            echo "  --model-type    模型类型 qwen2.5|qwen3 (默认: $DEFAULT_MODEL_TYPE)"
+            echo "  -h, --help      显示此帮助信息"
+            echo ""
+            echo "GPU配置说明:"
+            echo "  独立GPU配置: 每张GPU运行独立的ASR+LLM服务"
+            echo "  模型类型影响prompt优化策略 (qwen3减少思考链长度)"
+            exit 0
+            ;;
+        *)
+            echo "未知参数: $1"
+            echo "使用 -h 或 --help 查看帮助"
+            exit 1
+            ;;
+    esac
+done
+
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}    自动启动LLM服务（自适应GPU配置）${NC}"
+echo -e "${BLUE}    自动启动LLM服务（独立GPU配置）${NC}"
 echo -e "${BLUE}========================================${NC}"
+echo -e "${YELLOW}模型配置: ${MODEL_NAME} (类型: ${MODEL_TYPE})${NC}"
 
 # 激活conda环境
 source /root/miniforge3/etc/profile.d/conda.sh
@@ -34,95 +73,68 @@ fi
 GPU_COUNT=$(nvidia-smi --list-gpus | wc -l)
 echo -e "${YELLOW}检测到 ${GPU_COUNT} 张GPU${NC}"
 
-# 根据GPU数量配置服务
-if [ "$GPU_COUNT" -eq 4 ]; then
-    # 4卡配置
-    echo -e "${GREEN}使用4卡配置: GPU 0(LLM) + GPU 1,2,3(ASR)${NC}"
-    
-    # 启动组1的Ollama服务
-    echo -e "${YELLOW}启动Ollama服务 (GPU 0, 端口 11434)...${NC}"
-    CUDA_VISIBLE_DEVICES=0 nohup ollama serve > ./logs/ollama_0.log 2>&1 &
-    OLLAMA_PID=$!
-    echo $OLLAMA_PID > ./logs/ollama_0.pid
-    
-    # 等待Ollama服务启动
-    sleep 10
-    
-    # 拉取模型
-    echo -e "${YELLOW}拉取模型 qwen2.5:32b...${NC}"
-    CUDA_VISIBLE_DEVICES=0 ollama pull qwen2.5:32b
-    
-    # 启动LLM HTTP服务
-    echo -e "${YELLOW}启动LLM HTTP服务 (端口 8000)...${NC}"
-    CUDA_VISIBLE_DEVICES=0 nohup python3 llm_service.py \
-        --model_name qwen2.5:32b \
-        --ollama_host localhost:11434 \
-        --host 0.0.0.0 \
-        --port 8000 \
-        --workers 1 \
-        > ./logs/llm_service_0.log 2>&1 &
-    LLM_PID=$!
-    echo $LLM_PID > ./logs/llm_service_0.pid
-    
-    echo -e "${GREEN}4卡配置启动完成${NC}"
-    
-elif [ "$GPU_COUNT" -eq 8 ]; then
-    # 8卡配置
-    echo -e "${GREEN}使用8卡配置: 组1[GPU 0(LLM) + GPU 1,2,3(ASR)] + 组2[GPU 4(LLM) + GPU 5,6,7(ASR)]${NC}"
-    
-    # 启动组1的Ollama服务
-    echo -e "${YELLOW}启动组1 Ollama服务 (GPU 0, 端口 11434)...${NC}"
-    CUDA_VISIBLE_DEVICES=0 nohup ollama serve > ./logs/ollama_0.log 2>&1 &
-    OLLAMA_PID_0=$!
-    echo $OLLAMA_PID_0 > ./logs/ollama_0.pid
-    
-    # 启动组2的Ollama服务
-    echo -e "${YELLOW}启动组2 Ollama服务 (GPU 4, 端口 11435)...${NC}"
-    CUDA_VISIBLE_DEVICES=4 OLLAMA_HOST=0.0.0.0:11435 nohup ollama serve > ./logs/ollama_4.log 2>&1 &
-    OLLAMA_PID_4=$!
-    echo $OLLAMA_PID_4 > ./logs/ollama_4.pid
-    
-    # 等待Ollama服务启动
-    sleep 15
-    
-    # 拉取模型（两个GPU都拉取）
-    echo -e "${YELLOW}拉取模型 qwen2.5:32b (GPU 0)...${NC}"
-    CUDA_VISIBLE_DEVICES=0 ollama pull qwen2.5:32b
-    
-    echo -e "${YELLOW}拉取模型 qwen2.5:32b (GPU 4)...${NC}"
-    CUDA_VISIBLE_DEVICES=4 OLLAMA_HOST=localhost:11435 ollama pull qwen2.5:32b
-    
-    # 启动组1的LLM HTTP服务
-    echo -e "${YELLOW}启动组1 LLM HTTP服务 (端口 8000)...${NC}"
-    CUDA_VISIBLE_DEVICES=0 nohup python3 llm_service.py \
-        --model_name qwen2.5:32b \
-        --ollama_host localhost:11434 \
-        --host 0.0.0.0 \
-        --port 8000 \
-        --workers 1 \
-        > ./logs/llm_service_0.log 2>&1 &
-    LLM_PID_0=$!
-    echo $LLM_PID_0 > ./logs/llm_service_0.pid
-    
-    # 启动组2的LLM HTTP服务
-    echo -e "${YELLOW}启动组2 LLM HTTP服务 (端口 8001)...${NC}"
-    CUDA_VISIBLE_DEVICES=4 nohup python3 llm_service.py \
-        --model_name qwen2.5:32b \
-        --ollama_host localhost:11435 \
-        --host 0.0.0.0 \
-        --port 8001 \
-        --workers 1 \
-        > ./logs/llm_service_4.log 2>&1 &
-    LLM_PID_4=$!
-    echo $LLM_PID_4 > ./logs/llm_service_4.pid
-    
-    echo -e "${GREEN}8卡配置启动完成${NC}"
-    
-else
-    echo -e "${RED}不支持的GPU数量: ${GPU_COUNT}${NC}"
-    echo -e "${YELLOW}支持的配置: 4卡或8卡${NC}"
+# 每张GPU独立配置服务
+if [ "$GPU_COUNT" -lt 1 ]; then
+    echo -e "${RED}至少需要1张GPU${NC}"
     exit 1
 fi
+
+echo -e "${GREEN}使用独立GPU配置 (${GPU_COUNT}卡): 每张GPU运行独立的ASR+LLM服务${NC}"
+
+# 为每张GPU启动独立的Ollama服务
+echo -e "${YELLOW}启动Ollama服务...${NC}"
+for ((gpu=0; gpu<GPU_COUNT; gpu++)); do
+    ollama_port=$((11434 + gpu))
+    http_port=$((8000 + gpu))
+    
+    echo -e "${YELLOW}启动GPU ${gpu} Ollama服务 (端口 ${ollama_port})...${NC}"
+    if [ $gpu -eq 0 ]; then
+        # 第一个GPU使用默认端口
+        CUDA_VISIBLE_DEVICES=$gpu nohup ollama serve > ./logs/ollama_${gpu}.log 2>&1 &
+    else
+        # 其他GPU使用自定义端口
+        CUDA_VISIBLE_DEVICES=$gpu OLLAMA_HOST=0.0.0.0:${ollama_port} nohup ollama serve > ./logs/ollama_${gpu}.log 2>&1 &
+    fi
+    OLLAMA_PID=$!
+    echo $OLLAMA_PID > ./logs/ollama_${gpu}.pid
+done
+
+# 等待Ollama服务启动
+echo -e "${YELLOW}等待Ollama服务启动...${NC}"
+sleep 15
+
+# 为每张GPU拉取模型
+echo -e "${YELLOW}拉取模型...${NC}"
+for ((gpu=0; gpu<GPU_COUNT; gpu++)); do
+    ollama_port=$((11434 + gpu))
+    
+    echo -e "${YELLOW}GPU ${gpu} 拉取模型 ${MODEL_NAME}...${NC}"
+    if [ $gpu -eq 0 ]; then
+        CUDA_VISIBLE_DEVICES=$gpu ollama pull ${MODEL_NAME}
+    else
+        CUDA_VISIBLE_DEVICES=$gpu OLLAMA_HOST=localhost:${ollama_port} ollama pull ${MODEL_NAME}
+    fi
+done
+
+# 为每张GPU启动独立的LLM HTTP服务
+echo -e "${YELLOW}启动LLM HTTP服务...${NC}"
+for ((gpu=0; gpu<GPU_COUNT; gpu++)); do
+    ollama_port=$((11434 + gpu))
+    http_port=$((8000 + gpu))
+    
+    echo -e "${YELLOW}启动GPU ${gpu} LLM HTTP服务 (端口 ${http_port})...${NC}"
+    CUDA_VISIBLE_DEVICES=$gpu nohup python3 llm_service.py \
+        --model_name ${MODEL_NAME} \
+        --ollama_host localhost:${ollama_port} \
+        --host 0.0.0.0 \
+        --port ${http_port} \
+        --workers 1 \
+        > ./logs/llm_service_${gpu}.log 2>&1 &
+    LLM_PID=$!
+    echo $LLM_PID > ./logs/llm_service_${gpu}.pid
+done
+
+echo -e "${GREEN}独立GPU配置启动完成 (${GPU_COUNT}张GPU)${NC}"
 
 # 等待服务完全启动
 echo -e "${YELLOW}等待服务完全启动...${NC}"
@@ -131,28 +143,16 @@ sleep 15
 # 检查服务状态
 echo -e "${BLUE}检查服务状态:${NC}"
 
-if [ "$GPU_COUNT" -eq 4 ]; then
-    # 检查4卡配置的服务
-    if http_proxy="" https_proxy="" curl -s http://localhost:8000/health > /dev/null; then
-        echo -e "${GREEN}✓ LLM服务 (端口 8000) 正常运行${NC}"
-    else
-        echo -e "${RED}✗ LLM服务 (端口 8000) 连接失败${NC}"
+# 动态检查所有已启动的LLM服务端口
+for port in {8000..8010}; do
+    if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
+        if http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY="" curl -s http://localhost:$port/health > /dev/null; then
+            echo -e "${GREEN}✓ LLM服务 (端口 $port) 正常运行${NC}"
+        else
+            echo -e "${RED}✗ LLM服务 (端口 $port) 连接失败${NC}"
+        fi
     fi
-    
-elif [ "$GPU_COUNT" -eq 8 ]; then
-    # 检查8卡配置的服务
-    if http_proxy="" https_proxy="" curl -s http://localhost:8000/health > /dev/null; then
-        echo -e "${GREEN}✓ 组1 LLM服务 (端口 8000) 正常运行${NC}"
-    else
-        echo -e "${RED}✗ 组1 LLM服务 (端口 8000) 连接失败${NC}"
-    fi
-    
-    if http_proxy="" https_proxy="" curl -s http://localhost:8001/health > /dev/null; then
-        echo -e "${GREEN}✓ 组2 LLM服务 (端口 8001) 正常运行${NC}"
-    else
-        echo -e "${RED}✗ 组2 LLM服务 (端口 8001) 连接失败${NC}"
-    fi
-fi
+done
 
 echo -e "${BLUE}========================================${NC}"
 echo -e "${GREEN}    自动启动完成${NC}"
@@ -160,12 +160,14 @@ echo -e "${BLUE}========================================${NC}"
 
 echo -e "${YELLOW}使用提示:${NC}"
 echo -e "• 查看日志: tail -f ./logs/*.log"
-if [ "$GPU_COUNT" -eq 4 ]; then
-    echo -e "• LLM服务地址: http://localhost:8000"
-    echo -e "• 停止服务: kill \$(cat ./logs/ollama_0.pid) \$(cat ./logs/llm_service_0.pid)"
-elif [ "$GPU_COUNT" -eq 8 ]; then
-    echo -e "• 组1 LLM服务地址: http://localhost:8000"
-    echo -e "• 组2 LLM服务地址: http://localhost:8001"
-    echo -e "• 停止服务: kill \$(cat ./logs/ollama_*.pid) \$(cat ./logs/llm_service_*.pid)"
-fi
-echo -e "• 运行评估: python3 enhancement_audio_quality_assessment.py" 
+
+# 显示所有运行中的LLM服务地址
+echo -e "• LLM服务地址:"
+for port in {8000..8010}; do
+    if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
+        echo -e "  - http://localhost:$port"
+    fi
+done
+
+echo -e "• 停止服务: ./stop_multi_llm_services.sh"
+echo -e "• 运行评估: python3 enhancement_audio_quality_assessment.py --llm_model_type ${MODEL_TYPE} --llm_model_name ${MODEL_NAME}" 

@@ -154,17 +154,26 @@ fi
 # 检查端口占用情况
 echo -e "\n${YELLOW}3. 检查端口占用情况...${NC}"
 
-# 检查常用的LLM服务端口
-PORTS=(8000 8001 8002 8003)
-for port in "${PORTS[@]}"; do
+# 检查LLM服务端口范围
+echo -e "${YELLOW}检查LLM服务端口 (8000-8010)...${NC}"
+for port in {8000..8010}; do
     if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
         echo -e "${YELLOW}端口 $port 仍被占用${NC}"
         PORT_PIDS=$(lsof -Pi :$port -sTCP:LISTEN -t)
         echo -e "${YELLOW}占用进程: $PORT_PIDS${NC}"
         
-        read -p "是否强制释放端口 $port? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
+        if [ -t 0 ]; then
+            # 交互模式
+            read -p "是否强制释放端口 $port? (y/N): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                for pid in $PORT_PIDS; do
+                    stop_process "$pid" "端口${port}占用进程"
+                done
+            fi
+        else
+            # 非交互模式，自动释放
+            echo -e "${YELLOW}非交互模式，自动释放端口 $port${NC}"
             for pid in $PORT_PIDS; do
                 stop_process "$pid" "端口${port}占用进程"
             done
@@ -174,14 +183,34 @@ for port in "${PORTS[@]}"; do
     fi
 done
 
-# 检查Ollama端口
-if lsof -Pi :11434 -sTCP:LISTEN -t >/dev/null 2>&1; then
-    echo -e "${YELLOW}端口 11434 (Ollama) 仍被占用${NC}"
-    PORT_PIDS=$(lsof -Pi :11434 -sTCP:LISTEN -t)
-    echo -e "${YELLOW}占用进程: $PORT_PIDS${NC}"
-else
-    echo -e "${GREEN}✓ 端口 11434 (Ollama) 已释放${NC}"
-fi
+# 检查Ollama端口范围
+echo -e "${YELLOW}检查Ollama服务端口 (11434-11444)...${NC}"
+for port in {11434..11444}; do
+    if lsof -Pi :$port -sTCP:LISTEN -t >/dev/null 2>&1; then
+        echo -e "${YELLOW}端口 $port (Ollama) 仍被占用${NC}"
+        PORT_PIDS=$(lsof -Pi :$port -sTCP:LISTEN -t)
+        echo -e "${YELLOW}占用进程: $PORT_PIDS${NC}"
+        
+        if [ -t 0 ]; then
+            # 交互模式
+            read -p "是否强制释放端口 $port? (y/N): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                for pid in $PORT_PIDS; do
+                    stop_process "$pid" "端口${port}占用进程"
+                done
+            fi
+        else
+            # 非交互模式，自动释放
+            echo -e "${YELLOW}非交互模式，自动释放端口 $port${NC}"
+            for pid in $PORT_PIDS; do
+                stop_process "$pid" "端口${port}占用进程"
+            done
+        fi
+    else
+        echo -e "${GREEN}✓ 端口 $port 已释放${NC}"
+    fi
+done
 
 echo -e "\n${BLUE}========================================${NC}"
 echo -e "${GREEN}    服务停止完成${NC}"

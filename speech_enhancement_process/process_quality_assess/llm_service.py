@@ -215,7 +215,12 @@ class OllamaLLMService:
     
     def _build_normalization_prompt(self, text1: str, text2: str) -> str:
         """构造标准化提示词"""
-        prompt = f"""你是语音识别文本标准化专家。请将两段文本标准化为统一格式，用于WER/CER计算。
+        # 根据模型类型决定是否添加直接回答指令
+        direct_instruction = ""
+        if "qwen3" in self.model_name.lower():
+            direct_instruction = "\n请直接给出标准化结果，不要进行过多分析和思考。"
+        
+        prompt = f"""你是语音识别文本标准化专家。请将两段文本标准化为统一格式，用于WER/CER计算。{direct_instruction}
 
 # 核心原则
 - 只做格式标准化，不改变语义内容

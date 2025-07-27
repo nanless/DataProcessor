@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 # 配置参数
 CONFIG = {
-    # 多目录配置：每个元素包含一个目录组的配置
+    # 多目录配置：每个元素包含一个数据集的配置
     'directory_configs': [
         {
             'name': 'default',  # 配置名称
@@ -74,9 +74,14 @@ CONFIG = {
     # 文本标准化配置 - 只使用LLM
     'text_normalization': 'llm',  # 文本标准化方式
     'use_llm_normalization': True,  # 是否使用LLM进行文本标准化
-    'llm_service_url': 'http://localhost:8000',  # 默认LLM服务URL（单组时使用）
+    'llm_service_url': 'http://localhost:8000',  # 默认LLM服务URL（向后兼容）
     'llm_timeout': 30,  # LLM服务超时时间（秒）
     'llm_max_retries': 3,  # LLM服务最大重试次数
+    # LLM模型配置
+    'llm_model_config': {
+        'model_name': 'qwen3:32b',
+        'model_type': 'qwen3',  # qwen2.5 或 qwen3
+    }
 }
 
 class AudioVolumeProcessor:
@@ -1019,59 +1024,36 @@ class QualityAssessmentProcessor:
         logger.info(f"GPU {self.gpu_id}: 文本结果已保存到: {text_result_file}")
 
 
-def detect_gpu_config():
-    """检测GPU配置并返回合适的配置方案"""
+def detect_gpu_config(model_type: str = "qwen3"):
+    """检测GPU配置并返回每张卡独立运行ASR+LLM的配置方案"""
     available_gpus = torch.cuda.device_count()
     
-    if available_gpus == 4:
-        # 4卡配置：GPU 0 用于LLM，GPU 1,2,3 用于ASR
-        return {
-            'gpu_groups': [
-                {
-                    'llm_gpu': 0,
-                    'asr_gpus': [1, 2, 3],
-                    'llm_service_url': 'http://localhost:8000',
-                    'group_id': 0
-                }
-            ],
-            'total_asr_gpus': 3,
-            'description': f"4卡配置：GPU 0(LLM服务) + GPU 1,2,3(ASR)"
-        }
-    elif available_gpus == 8:
-        # 8卡配置：分成两组，每组4卡
-        return {
-            'gpu_groups': [
-                {
-                    'llm_gpu': 0,
-                    'asr_gpus': [1, 2, 3],
-                    'llm_service_url': 'http://localhost:8000',
-                    'group_id': 0
-                },
-                {
-                    'llm_gpu': 4,
-                    'asr_gpus': [5, 6, 7],
-                    'llm_service_url': 'http://localhost:8001',
-                    'group_id': 1
-                }
-            ],
-            'total_asr_gpus': 6,
-            'description': f"8卡配置：组1[GPU 0(LLM) + GPU 1,2,3(ASR)] + 组2[GPU 4(LLM) + GPU 5,6,7(ASR)]"
-        }
-    else:
-        # 其他配置，使用原有逻辑
-        logger.warning(f"检测到{available_gpus}张GPU，使用传统配置模式")
-        return {
-            'gpu_groups': [
-                {
-                    'llm_gpu': 0,
-                    'asr_gpus': list(range(1, min(available_gpus, 4))),
-                    'llm_service_url': 'http://localhost:8000',
-                    'group_id': 0
-                }
-            ],
-            'total_asr_gpus': min(available_gpus - 1, 3),
-            'description': f"{available_gpus}卡传统配置：GPU 0(LLM服务) + GPU 1-{min(available_gpus-1, 3)}(ASR)"
-        }
+    if available_gpus < 1:
+        logger.error("至少需要1张GPU")
+        raise RuntimeError("至少需要1张GPU")
+    
+    # 每张GPU卡都独立运行ASR和LLM服务
+    gpu_groups = []
+    for gpu_id in range(available_gpus):
+        gpu_groups.append({
+            'llm_gpu': gpu_id,        # LLM运行在当前GPU
+            'asr_gpus': [gpu_id],     # ASR也运行在当前GPU
+            'llm_service_url': f'http://localhost:{8000 + gpu_id}',
+            'group_id': gpu_id
+        })
+    
+    description = f"独立GPU配置 ({available_gpus}卡): "
+    group_descs = []
+    for gpu_id in range(available_gpus):
+        group_descs.append(f"GPU {gpu_id}(ASR+LLM)")
+    description += " + ".join(group_descs)
+    
+    return {
+        'gpu_groups': gpu_groups,
+        'total_asr_gpus': available_gpus,  # 每张GPU都运行ASR
+        'description': description,
+        'model_type': model_type
+    }
 
 def split_audio_pairs(audio_pairs: List[Tuple[str, str]], num_splits: int) -> List[List[Tuple[str, str]]]:
     """将音频对列表分成多个子集"""
@@ -1443,6 +1425,13 @@ def main():
     parser.add_argument("--use_llm_normalization", action="store_true",
                        default=CONFIG['use_llm_normalization'],
                        help="使用LLM进行文本标准化")
+    parser.add_argument("--llm_model_name", type=str,
+                       default=CONFIG['llm_model_config']['model_name'],
+                       help="LLM模型名称（如qwen2.5:32b, qwen3:14b等）")
+    parser.add_argument("--llm_model_type", type=str,
+                       choices=['qwen2.5', 'qwen3'],
+                       default=CONFIG['llm_model_config']['model_type'],
+                       help="LLM模型类型（影响prompt优化策略，qwen3会减少思考链长度）")
     
     args = parser.parse_args()
     
@@ -1530,13 +1519,25 @@ def main():
         if hasattr(args, key) and getattr(args, key) is not None:
             CONFIG[key] = getattr(args, key)
     
+    # 更新LLM模型配置
+    if hasattr(args, 'llm_model_name') and args.llm_model_name is not None:
+        CONFIG['llm_model_config']['model_name'] = args.llm_model_name
+    if hasattr(args, 'llm_model_type') and args.llm_model_type is not None:
+        CONFIG['llm_model_config']['model_type'] = args.llm_model_type
+    
     # 确保GPU数量和ID列表一致（向后兼容）
     if len(CONFIG['gpu_ids']) != CONFIG['num_gpus']:
         CONFIG['gpu_ids'] = list(range(1, CONFIG['num_gpus'] + 1))  # 默认使用GPU 1,2,3...
     
+    # 获取LLM模型配置
+    model_config = CONFIG.get('llm_model_config', {})
+    model_type = model_config.get('model_type', 'qwen3')
+    model_name = model_config.get('model_name', 'qwen3:32b')
+    
     # 自动检测GPU配置
-    gpu_config = detect_gpu_config()
+    gpu_config = detect_gpu_config(model_type)
     logger.info(f"GPU配置检测结果: {gpu_config['description']}")
+    logger.info(f"LLM模型配置: {model_name} (类型: {model_type})")
     
     # 更新CONFIG中的GPU相关配置
     CONFIG['gpu_groups'] = gpu_config['gpu_groups']
@@ -1545,14 +1546,20 @@ def main():
     for group in gpu_config['gpu_groups']:
         CONFIG['gpu_ids'].extend(group['asr_gpus'])
     
+    # 将模型配置信息传递给GPU组
+    CONFIG['llm_model_config']['model_type'] = model_type
+    CONFIG['llm_model_config']['model_name'] = model_name
+    
     # 打印配置信息
-    print("音频质量评估脚本 (多GPU并行版本 - 自适应GPU配置)")
+    print("音频质量评估脚本 (独立GPU配置)")
     print("=" * 80)
     print(f"GPU配置:")
     for group in CONFIG['gpu_groups']:
-        print(f"  组 {group['group_id']}: LLM GPU {group['llm_gpu']}, ASR GPUs {group['asr_gpus']}")
-        print(f"    LLM服务: {group['llm_service_url']}")
-    print(f"总ASR GPU数量: {CONFIG['num_gpus']}")
+        gpu_id = group['group_id']
+        http_port = group['llm_service_url'].split(':')[-1]
+        ollama_port = 11434 + gpu_id
+        print(f"  GPU {gpu_id}: ASR+LLM服务 (HTTP:{http_port}, Ollama:{ollama_port})")
+    print(f"总GPU数量: {len(CONFIG['gpu_groups'])}")
     
     print(f"\n目录配置数量: {len(CONFIG['directory_configs'])}")
     for i, dir_config in enumerate(CONFIG['directory_configs']):

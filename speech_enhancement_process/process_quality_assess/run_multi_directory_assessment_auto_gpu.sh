@@ -10,6 +10,43 @@
 BASE_DIR="/root/group-shared/voiceprint/data/speech/speaker_verification"
 SCRIPT_DIR="/root/code/github_repos/DataProcessor/speech_enhancement_process/process_quality_assess"
 
+# 默认模型配置
+DEFAULT_MODEL_NAME="qwen3:32b"
+DEFAULT_MODEL_TYPE="qwen3"
+
+# 解析命令行参数
+MODEL_NAME="$DEFAULT_MODEL_NAME"
+MODEL_TYPE="$DEFAULT_MODEL_TYPE"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --model-name)
+            MODEL_NAME="$2"
+            shift 2
+            ;;
+        --model-type)
+            MODEL_TYPE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "用法: $0 [选项]"
+            echo "选项:"
+            echo "  --model-name    LLM模型名称 (默认: $DEFAULT_MODEL_NAME)"
+            echo "  --model-type    模型类型 qwen2.5|qwen3 (默认: $DEFAULT_MODEL_TYPE)"
+            echo "  -h, --help      显示此帮助信息"
+            echo ""
+            echo "GPU配置说明:"
+            echo "  独立GPU配置: 每张GPU运行独立的ASR+LLM服务"
+            echo "  模型类型影响prompt优化策略 (qwen3减少思考链长度)"
+            exit 0
+            ;;
+        *)
+            echo "未知参数: $1，忽略"
+            shift
+            ;;
+    esac
+done
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -18,8 +55,9 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}    音频质量评估 - 自动GPU配置${NC}"
+echo -e "${BLUE}    音频质量评估 - 独立GPU配置${NC}"
 echo -e "${BLUE}========================================${NC}"
+echo -e "${YELLOW}模型配置: ${MODEL_NAME} (类型: ${MODEL_TYPE})${NC}"
 
 # 切换到脚本目录
 cd $SCRIPT_DIR
@@ -30,7 +68,7 @@ conda activate kimi-audio
 
 # 检测GPU数量
 if command -v nvidia-smi &> /dev/null; then
-    GPU_COUNT=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits | head -1)
+    GPU_COUNT=$(nvidia-smi --list-gpus | wc -l)
     echo -e "${YELLOW}检测到 ${GPU_COUNT} 张GPU${NC}"
 else
     echo -e "${RED}错误: 无法检测GPU，请确保NVIDIA驱动正常工作${NC}"
@@ -38,25 +76,18 @@ else
 fi
 
 # 显示GPU配置说明
-if [ "$GPU_COUNT" -eq 4 ]; then
-    echo -e "${GREEN}4卡配置：${NC}"
-    echo -e "  • GPU 0: LLM服务 (端口8000)"
-    echo -e "  • GPU 1,2,3: ASR处理"
-elif [ "$GPU_COUNT" -eq 8 ]; then
-    echo -e "${GREEN}8卡配置：${NC}"
-    echo -e "  • 组1: GPU 0(LLM服务 端口8000) + GPU 1,2,3(ASR处理)"
-    echo -e "  • 组2: GPU 4(LLM服务 端口8001) + GPU 5,6,7(ASR处理)"
-else
-    echo -e "${YELLOW}${GPU_COUNT}卡配置：使用传统模式${NC}"
-    echo -e "  • GPU 0: LLM服务 (端口8000)"
-    echo -e "  • GPU 1-${GPU_COUNT}: ASR处理"
-fi
+echo -e "${GREEN}独立GPU配置 (${GPU_COUNT}卡): 每张GPU运行独立的ASR+LLM服务${NC}"
+for ((gpu=0; gpu<GPU_COUNT; gpu++)); do
+    http_port=$((8000 + gpu))
+    ollama_port=$((11434 + gpu))
+    echo -e "  • GPU ${gpu}: ASR+LLM服务 (HTTP端口${http_port}, Ollama端口${ollama_port})"
+done
 
 echo ""
 
 # 启动LLM服务
 echo -e "${YELLOW}步骤1: 启动LLM服务...${NC}"
-./auto_start_llm_services.sh
+./auto_start_llm_services.sh --model-name "${MODEL_NAME}" --model-type "${MODEL_TYPE}"
 
 if [ $? -ne 0 ]; then
     echo -e "${RED}错误: LLM服务启动失败${NC}"
@@ -96,7 +127,7 @@ for port in 8000 8001; do
     for attempt in 1 2 3; do
         echo -e "${YELLOW}检查LLM服务(端口$port) - 第${attempt}次尝试...${NC}"
         
-        if http_proxy="" https_proxy="" curl -s -f --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
+        if http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY="" curl -s -f --connect-timeout 5 --max-time 10 "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
             echo -e "${GREEN}✓ LLM服务(端口$port)健康检查通过${NC}"
             service_ok=true
             break
@@ -129,7 +160,9 @@ echo -e "${YELLOW}步骤2: 开始音频质量评估...${NC}"
 if [ -f "multi_directory_config_example.json" ]; then
     echo -e "${YELLOW}使用配置文件: multi_directory_config_example.json${NC}"
     python enhancement_audio_quality_assessment.py \
-        --config_file multi_directory_config_example.json
+        --config_file multi_directory_config_example.json \
+        --llm_model_name "${MODEL_NAME}" \
+        --llm_model_type "${MODEL_TYPE}"
 else
     echo -e "${YELLOW}配置文件不存在，使用默认参数...${NC}"
     python enhancement_audio_quality_assessment.py \
@@ -140,7 +173,9 @@ else
         --use_llm_normalization \
         --ten_vad_hop_size 256 \
         --ten_vad_threshold 0.5 \
-        --skip_existing
+        --skip_existing \
+        --llm_model_name "${MODEL_NAME}" \
+        --llm_model_type "${MODEL_TYPE}"
 fi
 
 ASSESSMENT_EXIT_CODE=$?

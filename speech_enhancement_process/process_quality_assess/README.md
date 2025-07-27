@@ -1,101 +1,64 @@
 # 音频质量评估系统
 
-一个基于深度学习的音频增强质量评估系统，支持自动GPU配置和多目录批量处理，使用Kimi-Audio进行语音识别，采用Qwen3-32B大语言模型进行文本标准化。
+基于深度学习的音频增强质量评估系统，采用独立GPU配置，每张GPU卡同时运行ASR和LLM服务。使用Kimi-Audio进行语音识别，使用Qwen大语言模型进行智能文本标准化。
 
-## 核心特性
+## 系统特性
 
-- **自适应GPU配置**: 自动检测4卡或8卡GPU环境，优化资源分配
-- **多目录批量处理**: 支持同时评估多个数据集或算法结果  
-- **LLM文本标准化**: 使用Qwen3-32B模型进行智能文本标准化
-- **TEN VAD集成**: 先进的语音活动检测技术
-- **灵活的音量匹配**: 支持多种音量匹配策略
-- **详细的评估报告**: 生成WER/CER指标和处理统计
-
-## 系统架构
-
-### GPU配置方案
-
-#### 4卡配置 (推荐最小配置)
-```
-GPU 0: Qwen3-32B LLM服务 (端口8000)
-GPU 1: Kimi-Audio ASR处理
-GPU 2: Kimi-Audio ASR处理  
-GPU 3: Kimi-Audio ASR处理
-```
-
-#### 8卡配置 (高性能配置)
-```
-组1:
-  GPU 0: Qwen3-32B LLM服务 (端口8000)
-  GPU 1,2,3: Kimi-Audio ASR处理
-
-组2:
-  GPU 4: Qwen3-32B LLM服务 (端口8001)
-  GPU 5,6,7: Kimi-Audio ASR处理
-```
-
-### 处理流程
-1. **音频预处理**: 重采样、音量匹配、格式转换
-2. **语音识别**: 使用Kimi-Audio进行转录
-3. **文本标准化**: 使用Qwen3-32B LLM智能标准化
-4. **质量评估**: 计算WER/CER指标
-5. **结果输出**: 生成详细报告
+- **独立GPU配置**: 每张GPU独立运行ASR+LLM服务，无单点故障
+- **线性扩展**: N张GPU = N个独立的ASR+LLM服务单元
+- **智能文本标准化**: Qwen模型自动处理语音识别结果的格式差异
+- **多目录批量处理**: 支持同时评估多个数据集
+- **自动服务管理**: 一键启动、监控、停止所有服务
 
 ## 快速开始
 
 ### 环境要求
 
-**硬件要求**:
-- GPU: NVIDIA A100/H100 (32GB+ VRAM)
-- 内存: 64GB+ RAM
-- 存储: 500GB+ 可用空间
+- **硬件**: NVIDIA GPU (8GB+ VRAM), 32GB+ RAM
+- **软件**: Linux, Python 3.8+, CUDA 11.8+, conda
 
-**软件要求**:
-- 操作系统: Linux Ubuntu 20.04+
-- Python: 3.8+
-- CUDA: 11.8+
-- Docker: 可选，用于容器化部署
-
-### 安装依赖
+### 系统检查
 
 ```bash
-# 激活conda环境
+# 1. 进入项目目录
+cd speech_enhancement_process/process_quality_assess
+
+# 2. 激活环境
 conda activate kimi-audio
 
-# 安装Python依赖
-pip install -r requirements.txt
-
-# 安装Ollama (如果未安装)
-curl -fsSL https://ollama.ai/install.sh | sh
+# 3. 运行系统测试（推荐）
+python test_system.py
 ```
 
 ### 一键运行
 
 ```bash
-cd speech_enhancement_process/process_quality_assess
-
-# 自动启动服务并运行评估
+# 启动服务并运行评估
 ./run_multi_directory_assessment_auto_gpu.sh
 ```
 
-### 分步执行
+## GPU配置方案
 
-```bash
-# 1. 启动LLM服务
-./auto_start_llm_services.sh
+系统自动检测GPU数量，为每张GPU配置独立服务：
 
-# 2. 运行音频质量评估
-python3 enhancement_audio_quality_assessment.py --config_file config.json
-
-# 3. 停止所有服务
-./stop_multi_llm_services.sh
+**4张GPU示例**:
+```
+GPU 0: ASR+LLM (HTTP:8000, Ollama:11434)
+GPU 1: ASR+LLM (HTTP:8001, Ollama:11435)
+GPU 2: ASR+LLM (HTTP:8002, Ollama:11436)
+GPU 3: ASR+LLM (HTTP:8003, Ollama:11437)
 ```
 
-## 配置说明
+**优势**:
+- 完全独立，任意一张GPU故障不影响其他GPU
+- 负载均衡，每张GPU承担相同工作量
+- 线性扩展，增加GPU即可线性提升性能
 
-### 基础配置文件
+## 完整使用流程
 
-创建配置文件 `config.json`:
+### 1. 准备配置文件
+
+创建或修改 `multi_directory_config_example.json`:
 
 ```json
 {
@@ -103,7 +66,7 @@ python3 enhancement_audio_quality_assessment.py --config_file config.json
     {
       "name": "dataset_name",
       "original_dir": "/path/to/original/audio",
-      "enhanced_dir": "/path/to/enhanced/audio", 
+      "enhanced_dir": "/path/to/enhanced/audio",
       "output_dir": "/path/to/output/results",
       "volume_matching": true,
       "volume_matching_method": "ten_vad_energy"
@@ -112,196 +75,129 @@ python3 enhancement_audio_quality_assessment.py --config_file config.json
   "kimi_model_path": "/path/to/Kimi-Audio-7B-Instruct",
   "kimi_audio_dir": "/path/to/Kimi-Audio",
   "use_llm_normalization": true,
-  "llm_service_url": "http://localhost:8000",
   "llm_timeout": 30,
   "llm_max_retries": 3,
-  "ten_vad_hop_size": 256,
-  "ten_vad_threshold": 0.5,
-  "max_audio_length": 600,
-  "skip_existing": false
+  "llm_model_config": {
+    "model_name": "qwen3:32b",
+    "model_type": "qwen3"
+  }
 }
 ```
 
-### 配置参数详解
-
-#### 目录配置 (directory_configs)
-- `name`: 配置名称，用于日志和报告标识
-- `original_dir`: 原始音频文件目录
-- `enhanced_dir`: 增强音频文件目录
-- `output_dir`: 评估结果输出目录
-- `volume_matching`: 是否启用音量匹配
-- `volume_matching_method`: 音量匹配方法 (`ten_vad_energy` 推荐)
-
-#### 模型配置
-- `kimi_model_path`: Kimi-Audio模型路径
-- `kimi_audio_dir`: Kimi-Audio代码库路径
-
-#### LLM配置
-- `use_llm_normalization`: 启用LLM文本标准化
-- `llm_service_url`: LLM服务地址
-- `llm_timeout`: LLM服务超时时间(秒)
-- `llm_max_retries`: LLM服务最大重试次数
-
-#### TEN VAD配置
-- `ten_vad_hop_size`: VAD帧跳跃大小(样本数)
-- `ten_vad_threshold`: VAD检测阈值(0.0-1.0)
-
-#### 其他配置
-- `max_audio_length`: 最大音频长度(秒)
-- `skip_existing`: 跳过已存在的结果文件
-
-### 多目录批量处理
-
-支持同时处理多个数据集：
-
-```json
-{
-  "directory_configs": [
-    {
-      "name": "dataset_A_zipenhancer",
-      "original_dir": "/data/dataset_A/original",
-      "enhanced_dir": "/data/dataset_A/zipenhancer_enhanced",
-      "output_dir": "/results/dataset_A_zipenhancer"
-    },
-    {
-      "name": "dataset_A_mossformer", 
-      "original_dir": "/data/dataset_A/original",
-      "enhanced_dir": "/data/dataset_A/mossformer_enhanced",
-      "output_dir": "/results/dataset_A_mossformer"
-    }
-  ]
-}
-```
-
-## 使用指南
-
-### 命令行参数
+### 2. 启动LLM服务
 
 ```bash
-python3 enhancement_audio_quality_assessment.py [选项]
+# 自动启动所有GPU的服务
+./auto_start_llm_services.sh --model-type qwen3 --model-name qwen3:32b
 
-主要参数:
-  --config_file CONFIG_FILE    配置文件路径
-  --num_gpus NUM_GPUS          GPU数量(自动检测)
-  --skip_existing              跳过已存在的结果
-  --max_audio_length SECONDS   最大音频长度
-  --llm_service_url URL        LLM服务地址
-  --llm_timeout TIMEOUT        LLM超时时间
-
-示例:
-  python3 enhancement_audio_quality_assessment.py --config_file config.json --skip_existing
-```
-
-### 服务管理
-
-#### 启动服务
-```bash
-# 自动启动 (推荐)
-./auto_start_llm_services.sh
-
-# 手动启动LLM服务
-python3 llm_service.py --model_name qwen3:32b --port 8000
-```
-
-#### 检查服务状态
-```bash
-# 检查LLM服务健康状态
+# 检查服务状态
 curl http://localhost:8000/health
-
-# 8卡配置检查第二组服务
 curl http://localhost:8001/health
-
-# 获取模型信息
-curl http://localhost:8000/model_info
 ```
 
-#### 停止服务
+### 3. 运行质量评估
+
+```bash
+# 方式1: 使用配置文件
+python enhancement_audio_quality_assessment.py \
+    --config_file multi_directory_config_example.json
+
+# 方式2: 使用命令行参数
+python enhancement_audio_quality_assessment.py \
+    --original_dir /path/to/original \
+    --enhanced_dir /path/to/enhanced \
+    --output_dir /path/to/output \
+    --llm_model_type qwen3 \
+    --llm_model_name qwen3:32b
+```
+
+### 4. 监控服务（可选）
+
+```bash
+# 启动服务监控
+./monitor_and_restart_llm.sh &
+
+# 查看监控日志
+tail -f ./logs/llm_monitor.log
+```
+
+### 5. 停止服务
+
 ```bash
 # 停止所有服务
 ./stop_multi_llm_services.sh
-
-# 手动停止
-kill $(cat ./logs/ollama_*.pid)
-kill $(cat ./logs/llm_service_*.pid)
 ```
 
-### 监控和调试
+## 核心脚本说明
 
-#### 查看日志
-```bash
-# 查看所有日志
-tail -f ./logs/*.log
+| 脚本 | 功能 | 使用场景 |
+|------|------|----------|
+| `run_multi_directory_assessment_auto_gpu.sh` | 主运行脚本 | 一键完成所有操作 |
+| `auto_start_llm_services.sh` | 启动LLM服务 | 手动管理服务 |
+| `enhancement_audio_quality_assessment.py` | 音频质量评估主程序 | 核心处理程序 |
+| `llm_service.py` | LLM HTTP服务 | 提供文本标准化API |
+| `stop_multi_llm_services.sh` | 停止所有服务 | 清理环境 |
+| `monitor_and_restart_llm.sh` | 服务监控 | 长期运行的稳定性保证 |
+| `test_system.py` | 系统功能测试 | 验证环境和配置 |
 
-# 查看LLM服务日志
-tail -f ./logs/llm_service_*.log
+## 配置参数详解
 
-# 查看Ollama日志  
-tail -f ./logs/ollama_*.log
-```
+### 目录配置 (directory_configs)
 
-#### 监控GPU使用
-```bash
-# 实时监控GPU状态
-watch -n 1 nvidia-smi
+- `name`: 配置名称，用于日志标识
+- `original_dir`: 原始音频文件目录
+- `enhanced_dir`: 增强音频文件目录  
+- `output_dir`: 评估结果输出目录
+- `volume_matching`: 是否启用音量匹配 (建议true)
+- `volume_matching_method`: 音量匹配方法 (推荐`ten_vad_energy`)
 
-# 查看GPU进程
-nvidia-smi pmon -i 0,1,2,3,4,5,6,7
-```
+### LLM模型配置 (llm_model_config)
 
-#### 性能监控
-```bash
-# 系统资源监控
-htop
+- `model_name`: Ollama模型名称 (如`qwen3:32b`, `qwen2.5:32b`)
+- `model_type`: 模型类型，影响prompt优化策略
+  - `qwen3`: 会添加"减少思考"指令，提高响应速度
+  - `qwen2.5`: 使用标准prompt
 
-# 网络连接检查
-netstat -tulpn | grep -E ':(8000|8001|11434|11435)'
-```
+### 其他关键参数
+
+- `kimi_model_path`: Kimi-Audio模型路径
+- `kimi_audio_dir`: Kimi-Audio代码库路径
+- `use_llm_normalization`: 必须为true，系统只支持LLM标准化
+- `llm_timeout`: LLM服务超时时间(秒)
+- `max_audio_length`: 最大音频长度(秒)，超过会截断
 
 ## 输出结果
 
 ### 目录结构
 ```
 output_dir/
-├── audio_results/              # 处理后的音频文件
-│   ├── original/              # 标准化后的原始音频
-│   └── enhanced/              # 标准化后的增强音频
-├── text_results/              # 文本识别结果
-│   ├── filename_text_results.json
-│   └── ...
-├── summary_report.json        # 总体评估报告
-└── processing_log.txt         # 处理日志
+├── subset_0/                    # GPU 0处理的结果
+│   ├── filename_assessment.json
+│   └── subset_0_results.json
+├── subset_1/                    # GPU 1处理的结果
+├── ...
+├── quality_assessment_results.json  # 合并后的所有结果
+└── assessment_summary.json         # 统计摘要
 ```
 
-### 评估指标
+### 关键指标
 
-#### 文本质量指标
-- **WER (Word Error Rate)**: 词错误率
-- **CER (Character Error Rate)**: 字符错误率
+- **WER (Word Error Rate)**: 词错误率，越低越好
+- **CER (Character Error Rate)**: 字符错误率，越低越好
+- **is_usable**: CER < 5% 的音频被标记为可用
 
-#### 音频处理指标
-- **Volume Gain**: 音量增益值
-- **Processing Time**: 处理时间
-- **Success Rate**: 成功处理率
-
-### 报告格式
-
+### 结果示例
 ```json
 {
-  "file_path": "/path/to/audio.wav",
-  "original_transcription": "原始转录文本",
-  "enhanced_transcription": "增强转录文本", 
-  "original_transcription_normalized": "标准化原始文本",
-  "enhanced_transcription_normalized": "标准化增强文本",
+  "original_transcription": "原始ASR结果",
+  "enhanced_transcription": "增强ASR结果",
+  "original_transcription_normalized": "LLM标准化后的原始文本",
+  "enhanced_transcription_normalized": "LLM标准化后的增强文本",
   "wer": 0.15,
   "cer": 0.08,
-  "volume_gain": 2.5,
   "is_usable": true,
-  "processing_time": 12.5,
-  "text_normalization_config": {
-    "method": "llm_only",
-    "llm_service_url": "http://localhost:8000",
-    "llm_enabled": true
-  }
+  "volume_scale_factor": 2.3,
+  "processing_time": 12.5
 }
 ```
 
@@ -310,207 +206,207 @@ output_dir/
 ### 常见问题
 
 #### 1. GPU内存不足
-**现象**: CUDA out of memory错误
-**解决方案**:
-- 确保每个LLM GPU有32GB+ VRAM
-- 减少并行处理的音频数量
-- 检查其他GPU进程
+**现象**: CUDA out of memory
 
+**解决方案**:
 ```bash
-# 检查GPU内存使用
+# 检查GPU状态
 nvidia-smi
 
-# 清理GPU缓存
-python3 -c "import torch; torch.cuda.empty_cache()"
+# 使用更小的模型
+./auto_start_llm_services.sh --model-name qwen3:14b --model-type qwen3
+
+# 减少并发数（修改配置文件中的GPU数量）
 ```
 
-#### 2. LLM服务连接失败
-**现象**: HTTP连接超时或拒绝连接
-**解决方案**:
-- 检查服务是否正常启动
-- 验证端口是否被占用
-- 检查防火墙设置
+#### 2. LLM服务启动失败  
+**现象**: 连接拒绝或超时
 
+**解决方案**:
 ```bash
 # 检查端口占用
-lsof -i :8000 -i :8001
+lsof -i :8000-8010
 
-# 检查服务进程
-ps aux | grep -E "(ollama|llm_service)"
-
-# 重启服务
+# 强制停止所有服务
 ./stop_multi_llm_services.sh
+
+# 查看详细日志
+tail -f ./logs/llm_service_*.log
+tail -f ./logs/ollama_*.log
+
+# 重新启动
 ./auto_start_llm_services.sh
 ```
 
 #### 3. 模型下载失败
-**现象**: 模型拉取超时或失败
-**解决方案**:
-- 检查网络连接
-- 使用代理或镜像源
-- 手动下载模型文件
+**现象**: 模型拉取超时
 
-```bash
+**解决方案**:
+```bash  
 # 手动拉取模型
 ollama pull qwen3:32b
 
 # 检查已安装模型
 ollama list
+
+# 使用代理（如果需要）
+export https_proxy=http://proxy:port
+ollama pull qwen3:32b
 ```
 
-#### 4. 音频处理错误
-**现象**: 音频文件读取或处理失败
-**解决方案**:
-- 检查音频文件格式和完整性
-- 验证文件路径和权限
-- 检查音频长度是否超限
+#### 4. 音频文件读取失败
+**现象**: 文件格式不支持或路径错误
 
+**解决方案**:
 ```bash
-# 检查音频文件信息
+# 检查音频文件
 ffprobe audio_file.wav
 
-# 转换音频格式
+# 转换格式
 ffmpeg -i input.mp3 -ar 16000 -ac 1 output.wav
+
+# 检查路径权限
+ls -la /path/to/audio/files/
 ```
 
 ### 调试模式
 
-启用详细日志输出:
-
+启用详细日志:
 ```bash
-# 设置日志级别
-export PYTHONPATH=/path/to/project
 export LOG_LEVEL=DEBUG
-
-# 运行调试模式
-python3 enhancement_audio_quality_assessment.py --config_file config.json --verbose
+python enhancement_audio_quality_assessment.py --config_file config.json
 ```
 
-### 性能优化
+查看实时日志:
+```bash
+# 查看所有服务日志
+tail -f ./logs/*.log
 
-#### GPU优化
-- 确保GPU驱动和CUDA版本兼容
-- 使用合适的批处理大小
-- 避免GPU内存碎片
-
-#### 网络优化
-- 使用本地LLM服务减少网络延迟
-- 增加连接超时时间
-- 启用HTTP连接池
-
-#### 存储优化
-- 使用SSD存储提高I/O性能
-- 合理设置临时文件目录
-- 定期清理处理缓存
+# 查看特定GPU日志
+tail -f ./logs/llm_service_0.log   # GPU 0
+tail -f ./logs/ollama_0.log        # GPU 0的Ollama服务
+```
 
 ## 高级用法
 
-### 自定义文本标准化
+### 多数据集批量处理
 
-虽然系统只使用LLM进行文本标准化，但可以通过修改LLM提示词来自定义标准化规则:
+配置多个目录同时处理:
 
-```python
-# 在llm_service.py中修改_build_normalization_prompt方法
-def _build_normalization_prompt(self, text1: str, text2: str) -> str:
-    # 自定义提示词内容
-    return custom_prompt
+```json
+{
+  "directory_configs": [
+    {
+      "name": "dataset_A_algorithm1",
+      "original_dir": "/data/dataset_A/original",
+      "enhanced_dir": "/data/dataset_A/algorithm1_enhanced",
+      "output_dir": "/results/dataset_A_algorithm1"
+    },
+    {
+      "name": "dataset_A_algorithm2",
+      "original_dir": "/data/dataset_A/original", 
+      "enhanced_dir": "/data/dataset_A/algorithm2_enhanced",
+      "output_dir": "/results/dataset_A_algorithm2"
+    }
+  ]
+}
 ```
 
-### 批处理脚本
-
-创建批处理脚本 `batch_process.sh`:
+### 自定义脚本集成
 
 ```bash
 #!/bin/bash
-CONFIG_DIR="./configs"
-for config in "$CONFIG_DIR"/*.json; do
+# 批量评估脚本示例
+
+configs=("config1.json" "config2.json" "config3.json")
+
+for config in "${configs[@]}"; do
     echo "处理配置: $config"
-    python3 enhancement_audio_quality_assessment.py --config_file "$config"
+    python enhancement_audio_quality_assessment.py --config_file "$config"
+    echo "完成: $config"
 done
 ```
 
 ### 结果分析
 
-使用Python脚本分析评估结果:
+使用Python分析结果:
 
 ```python
 import json
 import pandas as pd
+import glob
 
-def analyze_results(result_dir):
-    results = []
-    for json_file in glob.glob(f"{result_dir}/**/*.json", recursive=True):
-        with open(json_file, 'r') as f:
-            data = json.load(f)
-            results.append(data)
-    
-    df = pd.DataFrame(results)
-    print(f"平均WER: {df['wer'].mean():.3f}")
-    print(f"平均CER: {df['cer'].mean():.3f}")
-    return df
+# 读取所有结果
+results = []
+for file in glob.glob("*/quality_assessment_results.json"):
+    with open(file) as f:
+        data = json.load(f)
+        results.extend(data)
+
+# 转换为DataFrame分析
+df = pd.DataFrame(results)
+print(f"平均WER: {df['wer'].mean():.3f}")
+print(f"平均CER: {df['cer'].mean():.3f}")
+print(f"可用音频比例: {df['is_usable'].mean():.3f}")
 ```
 
-## API参考
+## 系统架构
 
-### LLM服务API
-
-#### 健康检查
-```http
-GET /health
 ```
-
-#### 模型信息
-```http
-GET /model_info
+┌─────────────────────────────────────────────────────────────┐
+│                    音频质量评估系统                          │
+├─────────────────────────────────────────────────────────────┤
+│  GPU 0              GPU 1              GPU 2              │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    │
+│  │ Kimi-Audio  │    │ Kimi-Audio  │    │ Kimi-Audio  │    │
+│  │ (ASR)       │    │ (ASR)       │    │ (ASR)       │    │
+│  └─────────────┘    └─────────────┘    └─────────────┘    │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    │
+│  │ Ollama      │    │ Ollama      │    │ Ollama      │    │
+│  │ :11434      │    │ :11435      │    │ :11436      │    │
+│  └─────────────┘    └─────────────┘    └─────────────┘    │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    │
+│  │ LLM HTTP    │    │ LLM HTTP    │    │ LLM HTTP    │    │
+│  │ :8000       │    │ :8001       │    │ :8002       │    │
+│  └─────────────┘    └─────────────┘    └─────────────┘    │
+└─────────────────────────────────────────────────────────────┘
 ```
-
-#### 文本标准化
-```http
-POST /normalize
-Content-Type: application/json
-
-{
-  "text1": "原始文本1", 
-  "text2": "原始文本2"
-}
-```
-
-### 配置文件Schema
-
-完整的JSON Schema定义请参考 `config_schema.json`。
-
-## 贡献指南
-
-欢迎提交Issues和Pull Requests来改进项目:
-
-1. Fork项目仓库
-2. 创建特性分支: `git checkout -b feature/new-feature`
-3. 提交更改: `git commit -am 'Add new feature'`
-4. 推送分支: `git push origin feature/new-feature`
-5. 创建Pull Request
-
-## 许可证
-
-本项目采用MIT许可证，详情请见 `LICENSE` 文件。
 
 ## 更新日志
 
-### v2.0.0 (最新)
-- 升级为Qwen3-32B模型
-- 简化文本标准化为仅使用LLM
-- 优化GPU资源分配
-- 改进错误处理和日志记录
+- **v2.0** (当前): 重构为独立GPU配置，简化脚本，优化文档
+- **v1.5**: 支持qwen3模型，添加prompt优化
+- **v1.0**: 初始版本，支持多GPU配置
 
-### v1.0.0
-- 初始版本发布
-- 支持多GPU配置
-- 集成TEN VAD
-- 实现批量处理功能
+## 完整流程总结
 
-## 联系方式
+```bash
+# 1. 系统检查
+python test_system.py
 
-如有问题或建议，请通过以下方式联系:
+# 2. 编辑配置文件（根据需要）
+nano multi_directory_config_example.json
 
-- 项目Issues: [GitHub Issues](https://github.com/your-repo/issues)
-- 邮箱: your-email@domain.com
-- 文档: [在线文档](https://your-docs.com) 
+# 3. 一键运行（推荐）
+./run_multi_directory_assessment_auto_gpu.sh
+
+# 或者分步运行：
+# 3a. 启动服务
+./auto_start_llm_services.sh --model-type qwen3 --model-name qwen3:32b
+
+# 3b. 运行评估
+python enhancement_audio_quality_assessment.py --config_file multi_directory_config_example.json
+
+# 3c. 停止服务
+./stop_multi_llm_services.sh
+```
+
+## 技术支持
+
+如有问题请检查：
+1. 日志文件 `./logs/*.log`
+2. GPU状态 `nvidia-smi`  
+3. 服务状态 `curl localhost:8000/health`
+4. 磁盘空间和权限
+
+项目地址: [GitHub](https://github.com/your-repo) 

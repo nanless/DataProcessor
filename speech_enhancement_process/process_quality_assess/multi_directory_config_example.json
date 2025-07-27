@@ -52,12 +52,17 @@
   "kimi_model_path": "/root/data/pretrained_models/Kimi-Audio-7B-Instruct",
   "kimi_audio_dir": "/root/code/github_repos/Kimi-Audio",
   "target_sr": 16000,
-  "skip_existing": true,
+  "skip_existing": false,
   "max_audio_length": 600,
   "ten_vad_hop_size": 256,
   "ten_vad_threshold": 0.5,
   "text_normalization": "llm",
   "use_llm_normalization": true,
   "llm_timeout": 30,
-  "llm_max_retries": 3
+  "llm_max_retries": 3,
+  "llm_model_config": {
+    "model_name": "qwen3:32b",
+    "model_type": "qwen3",
+    "comment": "每张GPU独立运行ASR+LLM服务，模型类型影响prompt优化策略"
+  }
 } 
