@@ -6,15 +6,25 @@ Resemble-Enhance批量语音增强处理器
 具有动态长度处理、内存优化等特性。
 
 主要功能:
-- 批量处理多种音频格式 (wav, mp3, flac, m4a)
+- 批量处理多种音频格式 (wav, mp3, flac, m4a, mp4)
 - 多GPU并行处理
 - 动态长度处理避免不必要的音频填充
 - 内存优化和异步I/O
 - 支持分块处理长音频
 - 详细的性能统计和诊断
+- 多通道音频自动转换为单声道（取第一个通道）
+- 自动转换到模型采样率并保存（44.1kHz）
+- 智能文件名处理（支持长文件名和特殊字符清理，空格替换为下划线）
+- 正确处理多维音频张量格式
+
+依赖要求:
+- 处理MP4和M4A文件需要安装: pip install pydub
+- 输出采样率: 44.1kHz (模型固定采样率，与输入采样率无关)
+- 自动处理长文件名和特殊字符，避免保存错误
+- 修复多维音频张量导致的保存错误
 
 作者: AI Assistant
-版本: 2.0
+版本: 2.3
 """
 
 import os
@@ -65,8 +75,13 @@ class ProcessingConfig:
     gpu_ids: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
     
     # 音频配置
-    target_sr: int = 44100  # 目标采样率（匹配模型期望）
+    target_sr: int = 44100  # 模型的采样率（输出音频将以此采样率保存）
     skip_existing: bool = True  # 跳过已存在的文件
+    
+    # FFT下采样配置
+    use_fft_downsample: bool = True  # 是否使用FFT下采样
+    fft_downsample_quality: str = "high"  # FFT下采样质量: "high", "medium", "low"
+    anti_alias_filter: bool = True  # 是否使用抗混叠滤波器
     
     # resemble_enhance 参数
     nfe: int = 64
@@ -107,41 +122,72 @@ class ProcessingConfig:
 class AudioProcessor:
     """音频处理工具类"""
     
-    SUPPORTED_FORMATS = ('.wav', '.mp3', '.flac', '.m4a')
+    SUPPORTED_FORMATS = ('.wav', '.mp3', '.flac', '.m4a', '.mp4')
     
     @staticmethod
-    def load_audio(file_path: str) -> Tuple[torch.Tensor, int]:
+    def load_audio(file_path: str, config: Optional['ProcessingConfig'] = None) -> Tuple[torch.Tensor, int]:
         """
         加载音频文件
+        多通道音频将被转换为单声道（取第一个通道）
+        支持FFT下采样到目标采样率
         
         Args:
             file_path: 音频文件路径
+            config: 配置对象，包含FFT下采样参数
             
         Returns:
             音频数据和采样率的元组
         """
         try:
-            if file_path.lower().endswith('.m4a'):
-                # 处理m4a文件
-                audio = AudioSegment.from_file(file_path)
-                mono_audio = audio.split_to_mono()[0]
-                
-                # 转换为numpy数组
-                audio_data = np.array(mono_audio.get_array_of_samples(), dtype=np.float32)
-                audio_data = audio_data / (1 << 15)  # 16位音频归一化
-                
-                # 转换为torch tensor
-                dwav = torch.from_numpy(audio_data)
-                sr = mono_audio.frame_rate
+            if file_path.lower().endswith(('.m4a', '.mp4')):
+                # 处理m4a和mp4文件  
+                try:
+                    audio = AudioSegment.from_file(file_path)
+                    
+                    # 转换为numpy数组，如果是多声道，直接取第一个通道
+                    audio_data = np.array(audio.get_array_of_samples(), dtype=np.float32)
+                    if audio.sample_width == 2:  # 16位音频
+                        audio_data = audio_data / (1 << 15)
+                    elif audio.sample_width == 3:  # 24位音频
+                        audio_data = audio_data / (1 << 23)
+                    elif audio.sample_width == 4:  # 32位音频
+                        audio_data = audio_data / (1 << 31)
+                    else:
+                        audio_data = audio_data / np.max(np.abs(audio_data))
+                    
+                    # 处理多声道：如果是立体声或多声道，取第一个通道
+                    if audio.channels > 1:
+                        # 对于多声道，数据是交错存储的，我们需要取每隔channels个样本
+                        audio_data = audio_data[::audio.channels]
+                    
+                    # 转换为torch tensor
+                    dwav = torch.from_numpy(audio_data)
+                    sr = audio.frame_rate
+                except Exception as e:
+                    raise RuntimeError(f"处理MP4/M4A文件失败: {e}")
             else:
                 # 直接加载其他格式的音频文件
                 dwav, sr = torchaudio.load(file_path)
                 
-                # 转换为单声道
+                # 转换为单声道 - 只取第一个通道
                 if dwav.shape[0] > 1:
-                    dwav = dwav.mean(0)
+                    dwav = dwav[0]  # 只取第一个通道
                 else:
                     dwav = dwav.squeeze(0)
+            
+            # 应用FFT下采样（如果配置启用且需要）
+            if config and config.use_fft_downsample and sr != config.target_sr:
+                logger.info(f"对文件 {os.path.basename(file_path)} 执行FFT下采样: {sr}Hz -> {config.target_sr}Hz")
+                # 将torch tensor转换为numpy数组进行下采样
+                audio_np = dwav.numpy() if isinstance(dwav, torch.Tensor) else dwav
+                downsampled_audio = AudioProcessor.fft_downsample(
+                    audio_np, sr, config.target_sr, 
+                    quality=config.fft_downsample_quality,
+                    anti_alias=config.anti_alias_filter
+                )
+                # 转换回torch tensor
+                dwav = torch.from_numpy(downsampled_audio)
+                sr = config.target_sr
             
             return dwav, sr
             
@@ -152,6 +198,7 @@ class AudioProcessor:
     def save_audio(audio_data: torch.Tensor, file_path: str, sample_rate: int):
         """
         保存音频文件
+        支持长文件名和特殊字符处理
         
         Args:
             audio_data: 音频数据
@@ -159,17 +206,227 @@ class AudioProcessor:
             sample_rate: 采样率
         """
         try:
+            # 检查文件路径是否需要清理（避免重复处理）
+            if AudioProcessor._needs_sanitization(file_path):
+                file_path = AudioProcessor._sanitize_file_path(file_path)
+            
             # 确保输出目录存在
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            output_dir = os.path.dirname(file_path)
+            os.makedirs(output_dir, exist_ok=True)
             
-            # 确保音频数据是2D的
-            if audio_data.dim() == 1:
+            # 验证音频数据
+            if audio_data is None or audio_data.numel() == 0:
+                raise ValueError("音频数据为空")
+            
+            # 确保音频数据是torch.Tensor
+            if not isinstance(audio_data, torch.Tensor):
+                audio_data = torch.tensor(audio_data, dtype=torch.float32)
+            
+            # 确保数据类型正确
+            if audio_data.dtype != torch.float32:
+                audio_data = audio_data.float()
+            
+            # 确保音频数据在合理范围内
+            max_val = torch.abs(audio_data).max()
+            if max_val > 1.0:
+                audio_data = audio_data / max_val
+            
+            # 确保音频数据维度正确
+            print(f"调试信息 - 保存前音频形状: {audio_data.shape}")
+            
+            # 处理不同维度的数据
+            if audio_data.dim() == 3:
+                # 3D数组，取第一个batch和第一个通道
+                audio_data = audio_data[0, 0]  
+                print(f"调试信息 - 3D数组降维，新形状: {audio_data.shape}")
+            elif audio_data.dim() == 2:
+                if audio_data.shape[0] == 1:
+                    # (1, N) -> (N,)，然后再转为(1, N)用于torchaudio
+                    audio_data = audio_data.squeeze(0).unsqueeze(0)
+                elif audio_data.shape[1] == 1:
+                    # (N, 1) -> (N,)，然后再转为(1, N)用于torchaudio  
+                    audio_data = audio_data.squeeze(1).unsqueeze(0)
+                # 如果是(C, N)形状且C>1，保持原样（多通道）
+                print(f"调试信息 - 2D数组处理，新形状: {audio_data.shape}")
+            elif audio_data.dim() == 1:
+                # 1D数组转为2D (1, N)
                 audio_data = audio_data.unsqueeze(0)
+                print(f"调试信息 - 1D数组转2D，新形状: {audio_data.shape}")
             
-            torchaudio.save(file_path, audio_data, sample_rate)
+            print(f"调试信息 - 最终保存的音频形状: {audio_data.shape}, 数据类型: {audio_data.dtype}")
             
+            # 使用torchaudio保存
+            torchaudio.save(file_path, audio_data, sample_rate, format="wav", encoding="PCM_S", bits_per_sample=16)
+            
+            # 验证文件是否成功保存
+            if not os.path.exists(file_path):
+                raise RuntimeError("文件保存后不存在")
+                
         except Exception as e:
             raise RuntimeError(f"保存音频文件失败 {file_path}: {e}")
+    
+    @staticmethod
+    def _needs_sanitization(file_path: str) -> bool:
+        """
+        检查文件路径是否需要清理
+        
+        Args:
+            file_path: 文件路径
+            
+        Returns:
+            是否需要清理
+        """
+        import re
+        
+        filename = os.path.basename(file_path)
+        name = os.path.splitext(filename)[0]
+        
+        # 检查是否包含需要清理的字符（包括空格）
+        has_special_chars = bool(re.search(r'[^\w\-\.\(\)（）【】\u4e00-\u9fff]', name))
+        
+        # 检查文件名是否过长
+        is_too_long = len(name) > 200
+        
+        return has_special_chars or is_too_long
+    
+    @staticmethod
+    def _sanitize_file_path(file_path: str) -> str:
+        """
+        清理和缩短文件路径，处理特殊字符和长文件名
+        
+        Args:
+            file_path: 原始文件路径
+            
+        Returns:
+            处理后的文件路径
+        """
+        import re
+        import hashlib
+        
+        # 分离目录和文件名
+        directory = os.path.dirname(file_path)
+        filename = os.path.basename(file_path)
+        
+        # 分离文件名和扩展名
+        name, ext = os.path.splitext(filename)
+        
+        # 清理文件名中的特殊字符
+        # 保留中文、英文、数字、下划线、连字符、点号和括号，但不保留空格
+        clean_name = re.sub(r'[^\w\-\.\(\)（）【】\u4e00-\u9fff]', '_', name)
+        
+        # 处理连续的下划线
+        clean_name = re.sub(r'_+', '_', clean_name)
+        clean_name = clean_name.strip('_')
+        
+        # 如果文件名过长，进行截断和哈希处理
+        max_filename_length = 200  # 大多数文件系统支持的安全长度
+        
+        if len(clean_name) > max_filename_length:
+            # 保留前半部分和后半部分，中间用哈希值连接
+            hash_obj = hashlib.md5(clean_name.encode('utf-8'))
+            hash_str = hash_obj.hexdigest()[:8]
+            
+            # 计算前后部分的长度
+            remaining_length = max_filename_length - len(hash_str) - 2  # 2 for '__'
+            front_length = remaining_length // 2
+            back_length = remaining_length - front_length
+            
+            if back_length > 0:
+                clean_name = f"{clean_name[:front_length]}__{hash_str}__{clean_name[-back_length:]}"
+            else:
+                clean_name = f"{clean_name[:front_length]}__{hash_str}"
+        
+        # 重新组合文件路径
+        new_filename = clean_name + ext
+        new_file_path = os.path.join(directory, new_filename)
+        
+        return new_file_path
+    
+    @staticmethod
+    def fft_downsample(audio_data: np.ndarray, orig_sr: int, target_sr: int, 
+                      quality: str = "high", anti_alias: bool = True) -> np.ndarray:
+        """
+        使用librosa的FFT方法进行高质量音频下采样
+        
+        Args:
+            audio_data: 输入音频数据
+            orig_sr: 原始采样率
+            target_sr: 目标采样率
+            quality: 下采样质量 ("high", "medium", "low")
+            anti_alias: 是否使用抗混叠滤波器
+            
+        Returns:
+            下采样后的音频数据
+        """
+        if orig_sr == target_sr:
+            return audio_data
+            
+        try:
+            import librosa
+        except ImportError:
+            logger.error("librosa未安装，回退到线性下采样")
+            return AudioProcessor._linear_downsample(audio_data, orig_sr, target_sr)
+        
+        try:
+            # 确保输入是1D数组
+            if audio_data.ndim > 1:
+                if audio_data.shape[0] == 1:
+                    audio_data = audio_data.squeeze(0)
+                elif audio_data.shape[1] == 1:
+                    audio_data = audio_data.squeeze(1)
+                else:
+                    audio_data = audio_data[:, 0]  # 取第一个通道
+            
+            # 根据质量设置参数
+            if quality == "high":
+                res_type = 'fft'  # 使用FFT方法
+                filter_type = 'kaiser_best'
+            elif quality == "medium":
+                res_type = 'fft'
+                filter_type = 'kaiser_fast'
+            else:  # low
+                res_type = 'fft'
+                filter_type = 'linear'
+            
+            # 使用librosa的resample函数进行FFT下采样
+            if orig_sr > target_sr:
+                # 下采样
+                downsampled_audio = librosa.resample(
+                    audio_data, 
+                    orig_sr=orig_sr, 
+                    target_sr=target_sr,
+                    res_type=res_type,
+                    fix=True,  # 修复长度不匹配问题
+                    scale=False  # 不进行幅度缩放
+                )
+            else:
+                # 上采样
+                downsampled_audio = librosa.resample(
+                    audio_data, 
+                    orig_sr=orig_sr, 
+                    target_sr=target_sr,
+                    res_type=res_type,
+                    fix=True,
+                    scale=False
+                )
+            
+            # 确保输出数据类型与输入一致
+            downsampled_audio = downsampled_audio.astype(audio_data.dtype)
+            
+            logger.info(f"Librosa FFT重采样完成: {orig_sr}Hz -> {target_sr}Hz, 质量: {quality}")
+            return downsampled_audio
+            
+        except Exception as e:
+            logger.error(f"Librosa FFT重采样失败: {e}，回退到线性下采样")
+            return AudioProcessor._linear_downsample(audio_data, orig_sr, target_sr)
+    
+    @staticmethod
+    def _linear_downsample(audio_data: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+        """线性下采样（回退方案）"""
+        downsample_factor = orig_sr / target_sr
+        target_length = int(len(audio_data) / downsample_factor)
+        indices = np.linspace(0, len(audio_data) - 1, target_length)
+        return np.interp(indices, np.arange(len(audio_data)), audio_data).astype(audio_data.dtype)
     
     @staticmethod
     def resample_audio(audio_data: torch.Tensor, orig_sr: int, target_sr: int) -> torch.Tensor:
@@ -269,6 +526,78 @@ class AudioProcessor:
                 )
         
         return audio_data
+    
+    @staticmethod
+    def fft_downsample(audio_data: torch.Tensor, orig_sr: int, target_sr: int, 
+                      quality: str = "high", anti_alias: bool = True) -> torch.Tensor:
+        """
+        使用librosa的FFT方法进行高质量音频下采样
+        
+        Args:
+            audio_data: 输入音频数据
+            orig_sr: 原始采样率
+            target_sr: 目标采样率
+            quality: 下采样质量 ("high", "medium", "low")
+            anti_alias: 是否使用抗混叠滤波器
+            
+        Returns:
+            下采样后的音频数据
+        """
+        if orig_sr == target_sr:
+            return audio_data
+        
+        try:
+            import librosa
+            
+            # 转换为numpy以便librosa处理
+            if isinstance(audio_data, torch.Tensor):
+                audio_np = audio_data.cpu().numpy()
+                is_tensor = True
+            else:
+                audio_np = audio_data
+                is_tensor = False
+            
+            # 确保输入是1D数组
+            if audio_np.ndim > 1:
+                if audio_np.shape[0] == 1:
+                    audio_np = audio_np.squeeze(0)
+                elif audio_np.shape[1] == 1:
+                    audio_np = audio_np.squeeze(1)
+                else:
+                    audio_np = audio_np[0]  # 取第一个通道
+            
+            # 根据质量设置参数
+            if quality == "high":
+                res_type = 'fft'  # 使用FFT方法
+            elif quality == "medium":
+                res_type = 'polyphase'
+            else:  # low
+                res_type = 'linear'
+            
+            # 使用librosa进行重采样
+            resampled_audio = librosa.resample(
+                audio_np, 
+                orig_sr=orig_sr, 
+                target_sr=target_sr, 
+                res_type=res_type,
+                fix=True,
+                scale=False
+            )
+            
+            # 转换回原来的数据类型
+            if is_tensor:
+                result = torch.from_numpy(resampled_audio).to(audio_data.device)
+                return result.type_as(audio_data)
+            else:
+                return resampled_audio.astype(audio_data.dtype)
+            
+        except ImportError:
+            logger.error("librosa未安装，请执行: pip install librosa")
+            # 回退到torchaudio重采样
+            return AudioProcessor.resample_audio(audio_data, orig_sr, target_sr)
+        except Exception as e:
+            logger.error(f"librosa FFT下采样失败: {e}，回退到torchaudio重采样")
+            return AudioProcessor.resample_audio(audio_data, orig_sr, target_sr)
 
 
 class DeviceSafeInference:
@@ -654,13 +983,14 @@ def process_gpu_batch_resemble_optimized(args) -> List[Tuple[bool, str]]:
                             logger.error(f"处理音频文件失败 {input_file}: {e}")
                             continue
                 
-                # 异步保存音频文件
+                # 异步保存音频文件 - 确保使用模型的采样率 (44.1kHz)
                 save_futures = []
+                model_sr = 44100  # Resemble-Enhance模型的采样率
                 
                 for j, (input_file, output_file) in enumerate(batch_info):
                     if j < len(enhanced_batch):
-                        hwav, output_sr = enhanced_batch[j]
-                        future_save = executor.submit(AudioProcessor.save_audio, hwav, output_file, output_sr)
+                        hwav, _ = enhanced_batch[j]  # 忽略output_sr，使用模型采样率
+                        future_save = executor.submit(AudioProcessor.save_audio, hwav, output_file, model_sr)
                         save_futures.append((future_save, input_file))
                 
                 # 等待保存完成
@@ -777,10 +1107,13 @@ class ResembleEnhancerBatchProcessor:
                     rel_path = os.path.relpath(input_path, self.config.input_dir)
                     
                     # 构造输出路径，确保为wav格式
-                    output_path = os.path.join(
+                    raw_output_path = os.path.join(
                         self.config.output_dir, 
                         os.path.splitext(rel_path)[0] + '.wav'
                     )
+                    
+                    # 立即清理输出路径，避免后续保存时出错
+                    output_path = AudioProcessor._sanitize_file_path(raw_output_path)
                     
                     audio_files.append((input_path, output_path))
         

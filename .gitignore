@@ -3,3 +3,4 @@ downloaded_models
 *.pyc
 checkpoints/
 logs/
+*.log2

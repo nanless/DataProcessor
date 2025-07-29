@@ -1,0 +1,106 @@
+{
+    "global_config": {
+        "kimi_model_path": "/root/data/pretrained_models/Kimi-Audio-7B-Instruct",
+        "kimi_audio_dir": "/root/code/github_repos/Kimi-Audio",
+        "target_sr": 16000,
+        "max_audio_length": 600,
+        "max_degradation": 0.02,
+        "num_gpus": 8,
+        "gpu_ids": [0, 1, 2, 3, 4, 5, 6, 7],
+        "llm_service_url": "http://localhost:8000",
+        "llm_timeout": 30,
+        "llm_max_retries": 3,
+        "use_llm_normalization": true,
+        "llm_model_config": {
+            "model_name": "qwen3:32b",
+            "model_type": "qwen3"
+        },
+        "ten_vad_config": {
+            "hop_size": 256,
+            "threshold": 0.5
+        },
+        "output_individual_json": true
+    },
+    "datasets": [
+        {
+            "name": "King-ASR-EN-Kid",
+            "base_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid",
+            "groundtruth_file": "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid/kaldi_files/prepared_data/text",
+            "wav_scp_file": "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid/kaldi_files/prepared_data/wav.scp",
+            "language": "en",
+            "enhancement_methods": [
+                {
+                    "name": "zipenhancer",
+                    "use_ten_vad_volume_matching": true,
+                    "description": "ZIP增强器，使用TEN-VAD音量匹配"
+                },
+                {
+                    "name": "mossformer",
+                    "use_ten_vad_volume_matching": false,
+                    "description": "MossFormer增强器，不使用TEN-VAD音量匹配"
+                }
+            ],
+            "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_integrated_by_groundtruth"
+        },
+        {
+            "name": "speechocean762",
+            "base_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762",
+            "groundtruth_file": "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762/kaldi_files/prepared_data/text",
+            "wav_scp_file": "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762/kaldi_files/prepared_data/wav.scp",
+            "language": "en",
+            "enhancement_methods": [
+                {
+                    "name": "zipenhancer",
+                    "use_ten_vad_volume_matching": true,
+                    "description": "ZIP增强器，使用TEN-VAD音量匹配"
+                },
+                {
+                    "name": "mossformer",
+                    "use_ten_vad_volume_matching": false,
+                    "description": "MossFormer增强器，直接复制不做音量匹配"
+                }
+            ],
+            "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762_integrated_by_groundtruth"
+        },
+        {
+            "name": "BAAI-ChildMandarin41.25H",
+            "base_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/BAAI-ChildMandarin41.25H",
+            "groundtruth_file": "/root/group-shared/voiceprint/data/speech/speaker_verification/BAAI-ChildMandarin41.25H/kaldi_files/prepared_data/text",
+            "wav_scp_file": "/root/group-shared/voiceprint/data/speech/speaker_verification/BAAI-ChildMandarin41.25H/kaldi_files/prepared_data/wav.scp",
+            "language": "zh",
+            "enhancement_methods": [
+                {
+                    "name": "zipenhancer",
+                    "use_ten_vad_volume_matching": true,
+                    "description": "ZIP增强器，使用TEN-VAD音量匹配"
+                },
+                {
+                    "name": "mossformer",
+                    "use_ten_vad_volume_matching": false,
+                    "description": "MossFormer增强器，不使用TEN-VAD音量匹配"
+                }
+            ],
+            "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/BAAI-ChildMandarin41.25H_integrated_by_groundtruth"
+        },
+        {
+            "name": "Chinese_English_Scripted_Speech_Corpus_Children",
+            "base_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/Chinese_English_Scripted_Speech_Corpus_Children",
+            "groundtruth_file": "/root/group-shared/voiceprint/data/speech/speaker_verification/Chinese_English_Scripted_Speech_Corpus_Children/kaldi_files/prepared_data/text",
+            "wav_scp_file": "/root/group-shared/voiceprint/data/speech/speaker_verification/Chinese_English_Scripted_Speech_Corpus_Children/kaldi_files/prepared_data/wav.scp",
+            "language": "mixed",
+            "enhancement_methods": [
+                {
+                    "name": "zipenhancer",
+                    "use_ten_vad_volume_matching": true,
+                    "description": "ZIP增强器，使用TEN-VAD音量匹配"
+                },
+                {
+                    "name": "mossformer",
+                    "use_ten_vad_volume_matching": false,
+                    "description": "MossFormer增强器，不使用音量匹配"
+                }
+            ],
+            "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/Chinese_English_Scripted_Speech_Corpus_Children_integrated_by_groundtruth"
+        }
+    ]
+} 
