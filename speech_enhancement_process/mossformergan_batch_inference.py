@@ -85,7 +85,7 @@ class MossFormerGANConfig:
     
     # 硬件配置
     device: str = "cuda"
-    gpu_ids: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
+    gpu_ids: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6, 7])
     
     # 音频配置
     target_sr: int = 16000  # 模型的采样率（输出音频将以此采样率保存）
@@ -103,6 +103,32 @@ class MossFormerGANConfig:
     use_multi_gpu: bool = True  # 是否使用多GPU
     use_multiprocess: bool = True  # 是否使用多进程
     batch_processing_mode: str = 'isolated_gpu'  # 批处理模式
+    
+    # 大文件处理和错误恢复参数
+    max_file_size_mb: float = 200.0  # 单文件最大大小限制(MB)
+    max_audio_duration_minutes: float = 120.0  # 单文件最大时长限制(分钟)
+    enable_process_recovery: bool = True  # 启用进程崩溃恢复
+    max_retry_attempts: int = 2  # 最大重试次数
+    process_timeout_minutes: int = 60  # 单个进程超时时间(分钟)
+    skip_large_files: bool = True  # 跳过超大文件
+    
+    # 异步处理管道配置
+    enable_async_pipeline: bool = True  # 启用异步处理管道
+    pipeline_queue_size: int = 2  # 管道队列大小（预处理缓冲区）
+    max_workers_per_gpu: int = 2  # 每个GPU的工作线程数
+    gpu_timeout_seconds: int = 1800  # GPU处理超时时间（秒）
+    
+    # 动态负载均衡参数
+    enable_dynamic_balancing: bool = True  # 启用动态负载均衡
+    initial_batch_ratio: float = 0.3  # 初始批次比例（30%文件先分配）
+    fast_gpu_bonus_ratio: float = 1.5  # 快速GPU奖励比例
+    
+    # 性能阈值配置
+    preprocess_warning_seconds: int = 120  # 预处理时间警告阈值（秒）
+    large_file_warning_mb: float = 200.0  # 大文件警告阈值（MB）
+    memory_warning_duration_minutes: float = 60.0  # 内存警告时长阈值（分钟）
+    thread_join_timeout_seconds: int = 30  # 线程等待超时时间（秒）
+    gpu_memory_usage_limit: float = 0.8  # GPU内存使用限制（80%）
     
     def __post_init__(self):
         """初始化后的验证"""
@@ -445,9 +471,12 @@ class AudioProcessor:
         return np.interp(indices, np.arange(len(audio_data)), audio_data).astype(audio_data.dtype)
 
 
+
+
+
 def process_gpu_batch_isolated(args) -> List[Tuple[bool, str]]:
     """
-    完全隔离的GPU处理函数
+    完全隔离的GPU处理函数 - 使用异步处理管道优化
     
     Args:
         args: 包含文件列表、GPU ID和其他参数的元组
@@ -455,17 +484,20 @@ def process_gpu_batch_isolated(args) -> List[Tuple[bool, str]]:
     Returns:
         处理结果列表
     """
-    file_list, gpu_id, model_name, task, target_sr, input_dir, output_dir, position = args
+    file_list, gpu_id, model_name, task, target_sr, input_dir, output_dir, position, config = args
     
     try:
         # 强制设置GPU设备 - 完全隔离
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         
-        # 重新导入所需库 - 这很重要，必须在设置环境变量后导入
+        # 重新导入所需库
         import torch
         import numpy as np
         import soundfile as sf
         from tqdm import tqdm
+        import threading
+        import queue
+        import tempfile
         
         # 等待一小段时间让CUDA正确初始化
         import time
@@ -502,246 +534,410 @@ def process_gpu_batch_isolated(args) -> List[Tuple[bool, str]]:
         except Exception as e:
             print(f"GPU {gpu_id} 进程: 获取设备信息失败: {e}")
             return [(False, f"获取设备信息失败: {e}") for _ in file_list]
+
         
-        # 在进程中导入ClearVoice
-        try:
-            from clearvoice import ClearVoice
-            
-            # 创建ClearVoice实例
-            clearvoice_instance = ClearVoice(task=task, model_names=[model_name])
-            
-            print(f"GPU {gpu_id} 模型加载成功，开始处理 {len(file_list)} 个文件")
-            
-            # 创建进度条
-            pbar = tqdm(file_list, desc=f"GPU {gpu_id}", position=position, leave=True)
-            
-            results = []
-            for i, (input_file, output_file) in enumerate(pbar):
-                try:
-                    # 检查是否跳过已存在的文件
-                    if os.path.exists(output_file):
-                        results.append((True, f"跳过已存在文件: {input_file}"))
-                        continue
-                    
-                    # 确保输出目录存在
-                    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                    
-                    # 加载和验证音频文件 - 支持FFT下采样
-                    from types import SimpleNamespace
-                    gpu_config = SimpleNamespace()
-                    gpu_config.use_fft_downsample = True  # 启用FFT下采样
-                    gpu_config.fft_downsample_quality = "high"  # 高质量
-                    gpu_config.anti_alias_filter = True  # 抗混叠滤波
-                    gpu_config.target_sr = target_sr  # 目标采样率
-                    
-                    audio, sr = AudioProcessor.load_and_validate_audio(input_file, gpu_config)
-                    
-                    if len(audio) == 0:
-                        raise ValueError("音频文件为空")
-                    
-                    # 处理音频 - 使用ClearVoice进行语音增强（文件进文件出）
-                    # 创建临时文件保存下采样后的音频
-                    
-                    # 创建临时文件
-                    temp_dir = tempfile.gettempdir()
-                    temp_filename = f"temp_audio_gpu{gpu_id}_{int(time.time())}_{os.getpid()}_{i}.wav"
-                    temp_input_path = os.path.join(temp_dir, temp_filename)
-                    
-                    try:
-                        # 保存音频到临时文件
-                        sf.write(temp_input_path, audio, sr, format='WAV', subtype='PCM_16')
-                        
-                        # 使用ClearVoice处理临时文件（文件进文件出）
-                        enhanced_audio = clearvoice_instance(temp_input_path, online_write=False)
-                        
-                    finally:
-                        # 清理临时文件
-                        if os.path.exists(temp_input_path):
-                            try:
-                                os.remove(temp_input_path)
-                            except:
-                                pass  # 忽略删除失败
-                    
-                    # 调试：检查增强音频的类型和属性
-                    print(f"调试信息 - 增强音频类型: {type(enhanced_audio)}")
-                    if hasattr(enhanced_audio, 'shape'):
-                        print(f"调试信息 - 增强音频形状: {enhanced_audio.shape}")
-                    if hasattr(enhanced_audio, 'dtype'):
-                        print(f"调试信息 - 增强音频数据类型: {enhanced_audio.dtype}")
-                    
-                    # 保存结果 - 不使用ClearVoice的write方法，使用自定义保存确保采样率控制 (16kHz)
-                    if enhanced_audio is not None:
-                        try:
-                            # 使用模型的采样率 (16kHz)
-                            model_sr = 16000
-                            
-                            # 处理不同格式的增强音频数据
-                            audio_data = None
-                            
-                            # 检查ClearVoice返回的数据类型
-                            import numpy as np
-                            import torch
-                            
-                            if isinstance(enhanced_audio, np.ndarray):
-                                audio_data = enhanced_audio.astype(np.float32)
-                                print(f"调试信息 - 检测到numpy数组，形状: {audio_data.shape}")
-                            elif isinstance(enhanced_audio, torch.Tensor):
-                                audio_data = enhanced_audio.detach().cpu().numpy().astype(np.float32)
-                                print(f"调试信息 - 检测到torch张量，转换后形状: {audio_data.shape}")
-                            elif isinstance(enhanced_audio, list):
-                                audio_data = np.array(enhanced_audio, dtype=np.float32)
-                                print(f"调试信息 - 检测到列表，转换后形状: {audio_data.shape}")
-                            elif hasattr(enhanced_audio, 'numpy'):
-                                # 某些类型可能有numpy()方法
-                                audio_data = enhanced_audio.numpy().astype(np.float32)
-                                print(f"调试信息 - 使用numpy()方法，形状: {audio_data.shape}")
-                            else:
-                                # 尝试直接转换
-                                audio_data = np.array(enhanced_audio, dtype=np.float32)
-                                print(f"调试信息 - 直接转换，形状: {audio_data.shape}")
-                            
-                            # 验证音频数据
-                            if audio_data is None or len(audio_data) == 0:
-                                raise ValueError("转换后的音频数据为空")
-                            
-                            # 处理多维数组 - 确保是1D
-                            if audio_data.ndim > 1:
-                                if audio_data.shape[0] == 1:
-                                    audio_data = audio_data.squeeze(0)
-                                elif audio_data.shape[1] == 1:
-                                    audio_data = audio_data.squeeze(1)
-                                else:
-                                    # 多通道，取第一个通道
-                                    audio_data = audio_data[0] if audio_data.shape[0] < audio_data.shape[1] else audio_data[:, 0]
-                                
-                                print(f"调试信息 - 降维后形状: {audio_data.shape}")
-                            
-                            # 使用AudioProcessor的save_audio方法保存
-                            AudioProcessor.save_audio(audio_data, output_file, model_sr)
-                        except Exception as save_error:
-                            # 如果自定义保存失败，尝试使用soundfile直接保存
-                            print(f"主要保存方法失败: {save_error}")
-                            try:
-                                import soundfile as sf
-                                import numpy as np
-                                import time
-                                model_sr = 16000
-                                
-                                # 重新处理音频数据（复用上面的逻辑）
-                                backup_audio_data = None
-                                if isinstance(enhanced_audio, np.ndarray):
-                                    backup_audio_data = enhanced_audio.astype(np.float32)
-                                elif isinstance(enhanced_audio, torch.Tensor):
-                                    backup_audio_data = enhanced_audio.detach().cpu().numpy().astype(np.float32)
-                                elif isinstance(enhanced_audio, list):
-                                    backup_audio_data = np.array(enhanced_audio, dtype=np.float32)
-                                else:
-                                    backup_audio_data = np.array(enhanced_audio, dtype=np.float32)
-                                
-                                # 处理多维数组
-                                if backup_audio_data.ndim > 1:
-                                    if backup_audio_data.shape[0] == 1:
-                                        backup_audio_data = backup_audio_data.squeeze(0)
-                                    elif backup_audio_data.shape[1] == 1:
-                                        backup_audio_data = backup_audio_data.squeeze(1)
-                                    else:
-                                        backup_audio_data = backup_audio_data[0] if backup_audio_data.shape[0] < backup_audio_data.shape[1] else backup_audio_data[:, 0]
-                                
-                                # 归一化
-                                if np.abs(backup_audio_data).max() > 1.0:
-                                    backup_audio_data = backup_audio_data / np.abs(backup_audio_data).max()
-                                
-                                # 尝试多种保存格式
-                                formats_to_try = [
-                                    ('WAV', 'PCM_16'),
-                                    ('WAV', 'PCM_24'),
-                                    ('WAV', 'FLOAT'),
-                                    (None, None)  # 让soundfile自动选择
-                                ]
-                                
-                                saved_successfully = False
-                                for fmt, subtype in formats_to_try:
-                                    try:
-                                        # 创建备用文件路径（简化文件名）
-                                        backup_path = os.path.join(
-                                            os.path.dirname(output_file),
-                                            f"backup_gpu{gpu_id}_{int(time.time())}_{os.getpid()}.wav"
-                                        )
-                                        
-                                        if fmt and subtype:
-                                            sf.write(backup_path, backup_audio_data, model_sr, format=fmt, subtype=subtype)
-                                        else:
-                                            sf.write(backup_path, backup_audio_data, model_sr)
-                                        
-                                        # 如果成功保存，尝试重命名
-                                        if os.path.exists(backup_path):
-                                            try:
-                                                import shutil
-                                                shutil.move(backup_path, output_file)
-                                                saved_successfully = True
-                                                print(f"备用保存成功，格式: {fmt}/{subtype}")
-                                                break
-                                            except Exception as rename_error:
-                                                print(f"重命名失败，但文件已保存到: {backup_path}")
-                                                saved_successfully = True
-                                                break
-                                    except Exception as format_error:
-                                        print(f"格式 {fmt}/{subtype} 保存失败: {format_error}")
-                                        continue
-                                
-                                if not saved_successfully:
-                                    raise Exception("所有备用保存格式都失败了")
-                                        
-                            except Exception as final_error:
-                                print(f"所有保存方法都失败: 主要错误={save_error}, 最终错误={final_error}")
-                                # 尝试保存原始音频数据用于调试
-                                try:
-                                    debug_path = os.path.join(
-                                        os.path.dirname(output_file),
-                                        f"debug_gpu{gpu_id}_{int(time.time())}_{os.getpid()}.txt"
-                                    )
-                                    with open(debug_path, 'w') as f:
-                                        f.write(f"Enhanced audio type: {type(enhanced_audio)}\n")
-                                        f.write(f"Enhanced audio: {str(enhanced_audio)[:500]}...\n")
-                                    print(f"调试信息已保存到: {debug_path}")
-                                except:
-                                    pass
-                                raise
-                        
-                        # 检查结果
-                        if os.path.exists(output_file):
-                            results.append((True, f"成功处理: {input_file}"))
-                            pbar.set_postfix({"状态": "成功"})
-                        else:
-                            results.append((False, f"处理失败，输出文件未生成: {input_file}"))
-                            pbar.set_postfix({"状态": "失败"})
-                    else:
-                        results.append((False, f"处理失败，无音频数据: {input_file}"))
-                        pbar.set_postfix({"状态": "失败"})
-                    
-                except Exception as e:
-                    results.append((False, f"处理失败 {input_file}: {e}"))
-                    pbar.set_postfix({"状态": "异常"})
-            
-            pbar.close()
-            
-            # 统计结果
-            success_count = sum(1 for success, _ in results if success)
-            print(f"GPU {gpu_id} 处理完成: {success_count}/{len(file_list)} 成功")
-            
-            return results
-            
-        except Exception as e:
-            print(f"GPU {gpu_id} 模型初始化失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return [(False, f"模型初始化失败: {e}") for _ in file_list]
+        # 启用异步处理管道
+        print(f"GPU {gpu_id} 启用异步处理管道")
+        
+        # 创建异步处理管道
+        return process_with_async_pipeline(
+            file_list, gpu_id, model_name, task, target_sr, position, config
+        )
             
     except Exception as e:
         print(f"GPU {gpu_id} 进程初始化失败: {e}")
         import traceback
         traceback.print_exc()
         return [(False, f"进程初始化失败: {e}") for _ in file_list]
+
+
+def process_with_async_pipeline(file_list, gpu_id, model_name, task, target_sr, position, config=None):
+    """
+    使用异步处理管道处理文件列表
+    
+    Args:
+        file_list: 待处理的文件列表
+        gpu_id: GPU ID
+        model_name: 模型名称
+        task: 任务类型
+        target_sr: 目标采样率
+        position: 进度条位置
+        config: MossFormerGANConfig 配置对象
+    """
+    import torch
+    import numpy as np
+    import soundfile as sf
+    from tqdm import tqdm
+    import threading
+    import queue
+    import tempfile
+    import time
+    from types import SimpleNamespace
+    
+    # 获取配置参数，如果没有传入则使用默认值
+    if config is None:
+        # 创建默认配置参数
+        from types import SimpleNamespace
+        config = SimpleNamespace()
+        config.pipeline_queue_size = 1
+        config.max_workers_per_gpu = 2
+        config.gpu_timeout_seconds = 600  # 使用配置类的默认值
+        config.use_fft_downsample = True
+        config.fft_downsample_quality = "high"
+        config.anti_alias_filter = True
+    
+    # 创建管道队列
+    queue_size = getattr(config, 'pipeline_queue_size', 1)
+    preprocessing_queue = queue.Queue(maxsize=queue_size)  # 预处理完成的文件队列
+    results_queue = queue.Queue()  # 结果队列
+    
+    results = []
+    
+    # 在进程中导入ClearVoice并初始化模型
+    try:
+        from clearvoice import ClearVoice
+        
+        # 强制使用设备0（在CUDA_VISIBLE_DEVICES隔离环境中）
+        torch.cuda.set_device(0)
+        
+        # 创建ClearVoice实例
+        clearvoice_instance = ClearVoice(task=task, model_names=[model_name])
+        
+        print(f"GPU {gpu_id} 模型加载成功，开始异步处理 {len(file_list)} 个文件")
+        
+    except Exception as e:
+        print(f"GPU {gpu_id} 模型初始化失败: {e}")
+        return [(False, f"模型初始化失败: {e}") for _ in file_list]
+    
+    # 预处理线程函数：负责音频加载和FFT下采样
+    def preprocessing_worker():
+        """预处理工作线程：音频加载和FFT下采样"""
+        # 使用传入的配置参数
+        gpu_config = config if hasattr(config, 'use_fft_downsample') else SimpleNamespace()
+        if not hasattr(gpu_config, 'use_fft_downsample'):
+            gpu_config.use_fft_downsample = True
+        if not hasattr(gpu_config, 'fft_downsample_quality'):
+            gpu_config.fft_downsample_quality = "high"
+        if not hasattr(gpu_config, 'anti_alias_filter'):
+            gpu_config.anti_alias_filter = True
+        gpu_config.target_sr = target_sr
+        
+        for i, (input_file, output_file) in enumerate(file_list):
+            try:
+                # 确保输出目录存在（强制覆盖已存在的文件）
+                os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                
+                # 如果文件已存在，先删除以确保重新处理
+                if os.path.exists(output_file):
+                    try:
+                        os.remove(output_file)
+                        print(f"🔄 GPU {gpu_id} 删除已存在文件: {os.path.basename(output_file)}")
+                    except Exception as e:
+                        print(f"⚠️ GPU {gpu_id} 删除文件失败，将覆盖: {e}")
+                
+                # 音频加载和FFT下采样
+                preprocess_start = time.time()
+                
+                # 获取文件详细信息和大文件预检查
+                try:
+                    file_size_mb = os.path.getsize(input_file) / (1024 * 1024)
+                except:
+                    file_size_mb = 0
+                
+                print(f"⏳ GPU {gpu_id} 开始预处理 {i+1}/{len(file_list)}:")
+                print(f"   📁 输入文件: {input_file}")
+                print(f"   📤 输出文件: {output_file}")  
+                print(f"   📊 文件大小: {file_size_mb:.2f} MB")
+                print(f"   🎵 文件格式: {os.path.splitext(input_file)[1].upper()}")
+                print(f"   📂 相对路径: {os.path.relpath(input_file)}")
+                try:
+                    import time as time_module
+                    mtime = os.path.getmtime(input_file)
+                    mtime_str = time_module.strftime('%Y-%m-%d %H:%M:%S', time_module.localtime(mtime))
+                    print(f"   🕒 修改时间: {mtime_str}")
+                except:
+                    pass
+                
+                # 大文件预检查 - 防止内存爆炸
+                max_file_size = getattr(config, 'max_file_size_mb', 100.0)
+                if file_size_mb > max_file_size:
+                    error_msg = f"文件过大({file_size_mb:.1f}MB > {max_file_size}MB)，跳过以防止内存溢出"
+                    print(f"⚠️ GPU {gpu_id}: {error_msg}")
+                    preprocessing_queue.put(('error', i, input_file, output_file, error_msg))
+                    continue
+                
+                try:
+                    audio, sr = AudioProcessor.load_and_validate_audio(input_file, gpu_config)
+                except MemoryError as mem_err:
+                    error_msg = f"内存不足，无法加载音频文件: {mem_err}"
+                    print(f"🚨 GPU {gpu_id}: {error_msg}")
+                    preprocessing_queue.put(('error', i, input_file, output_file, error_msg))
+                    continue
+                except Exception as load_err:
+                    error_msg = f"音频加载失败: {load_err}"
+                    print(f"❌ GPU {gpu_id}: {error_msg}")
+                    preprocessing_queue.put(('error', i, input_file, output_file, error_msg))
+                    continue
+                
+                if len(audio) == 0:
+                    preprocessing_queue.put(('error', i, input_file, output_file, "音频文件为空"))
+                    continue
+                
+                # 计算音频时长
+                audio_duration_minutes = len(audio) / sr / 60
+                
+                # 创建临时文件
+                temp_dir = tempfile.gettempdir()
+                temp_filename = f"temp_audio_gpu{gpu_id}_{int(time.time())}_{os.getpid()}_{i}.wav"
+                temp_input_path = os.path.join(temp_dir, temp_filename)
+                
+                # 保存预处理后的音频到临时文件
+                sf.write(temp_input_path, audio, sr, format='WAV', subtype='PCM_16')
+                
+                preprocess_time = time.time() - preprocess_start
+                
+                # 将预处理完成的数据放入队列
+                preprocessing_queue.put((
+                    'ready', i, input_file, output_file, temp_input_path, 
+                    audio_duration_minutes, preprocess_time
+                ))
+                
+                # 显示队列状态和性能警告
+                queue_size = preprocessing_queue.qsize()
+                
+                # 性能警告
+                warning_threshold = getattr(config, 'preprocess_warning_seconds', 120)
+                if preprocess_time > warning_threshold:
+                    print(f"🔄 GPU {gpu_id} 预处理完成 {i+1}/{len(file_list)}: {os.path.basename(input_file)} (时长 {audio_duration_minutes:.1f}min, 预处理 {preprocess_time:.2f}s, 队列 {queue_size}) ⚠️ 预处理时间较长")
+                else:
+                    print(f"🔄 GPU {gpu_id} 预处理完成 {i+1}/{len(file_list)}: {os.path.basename(input_file)} (时长 {audio_duration_minutes:.1f}min, 预处理 {preprocess_time:.2f}s, 队列 {queue_size})")
+                
+            except Exception as e:
+                preprocessing_queue.put(('error', i, input_file, output_file, str(e)))
+        
+        # 预处理完成，为每个GPU处理线程发送结束信号
+        max_workers = getattr(config, 'max_workers_per_gpu', 2)
+        for _ in range(max_workers):
+            preprocessing_queue.put(('done', None, None, None, None))
+    
+    # GPU处理线程函数：负责AI模型推理
+    def gpu_processing_worker():
+        """GPU处理工作线程：AI模型推理"""
+        processed_count = 0
+        
+        while True:
+            try:
+                # 从队列获取预处理完成的数据（增加超时时间以适应长音频文件）
+                item = preprocessing_queue.get()  # 无超时，适应长音频预处理
+                
+                if item[0] == 'done':
+                    break
+                elif item[0] == 'error':
+                    _, i, input_file, output_file, error_msg = item
+                    results_queue.put((False, f"预处理失败 {input_file}: {error_msg}"))
+                    processed_count += 1
+                elif item[0] == 'ready':
+                    _, i, input_file, output_file, temp_input_path, audio_duration_minutes, preprocess_time = item
+                    
+                    try:
+                        # GPU内存检查 - AI处理前
+                        if torch.cuda.is_available():
+                            gpu_mem_before = torch.cuda.memory_allocated(0) / (1024**3)  # GB
+                            gpu_mem_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+                            gpu_mem_free = gpu_mem_total - gpu_mem_before
+                            
+                            # 如果可用内存不足，先清理缓存
+                            if gpu_mem_free < 2.0:  # 少于2GB可用内存
+                                print(f"⚠️ GPU {gpu_id} 内存不足 ({gpu_mem_free:.1f}GB可用)，清理缓存...")
+                                torch.cuda.empty_cache()
+                                import gc
+                                gc.collect()
+                                
+                                # 重新检查内存
+                                gpu_mem_after_cleanup = torch.cuda.memory_allocated(0) / (1024**3)
+                                gpu_mem_free_after = gpu_mem_total - gpu_mem_after_cleanup
+                                print(f"   清理后可用内存: {gpu_mem_free_after:.1f}GB")
+                                
+                                # 如果清理后仍然内存不足，跳过该文件
+                                if gpu_mem_free_after < 1.0:  # 少于1GB可用内存
+                                    error_msg = f"GPU内存严重不足({gpu_mem_free_after:.1f}GB可用)，跳过大文件"
+                                    print(f"🚨 GPU {gpu_id}: {error_msg}")
+                                    results_queue.put((False, f"{error_msg}: {input_file}"))
+                                    continue
+                        
+                        # GPU AI处理
+                        print(f"🎯 GPU {gpu_id} AI处理开始: {os.path.basename(input_file)} (时长 {audio_duration_minutes:.1f}min)")
+                        gpu_start = time.time()
+                        
+                        try:
+                            enhanced_audio = clearvoice_instance(temp_input_path, online_write=False)
+                        except RuntimeError as cuda_err:
+                            # 处理CUDA内存溢出错误
+                            if "out of memory" in str(cuda_err).lower():
+                                error_msg = f"GPU显存不足，无法处理大文件 ({audio_duration_minutes:.1f}min)"
+                                print(f"🚨 GPU {gpu_id}: {error_msg}")
+                                
+                                # 强制清理GPU内存
+                                try:
+                                    torch.cuda.empty_cache()
+                                    import gc
+                                    gc.collect()
+                                    torch.cuda.synchronize()
+                                except:
+                                    pass
+                                
+                                results_queue.put((False, f"{error_msg}: {input_file}"))
+                                continue
+                            else:
+                                raise cuda_err
+                        except MemoryError as mem_err:
+                            error_msg = f"系统内存不足，无法处理大文件 ({audio_duration_minutes:.1f}min)"
+                            print(f"🚨 GPU {gpu_id}: {error_msg}")
+                            results_queue.put((False, f"{error_msg}: {input_file}"))
+                            continue
+                        
+                        gpu_time = time.time() - gpu_start
+                        print(f"⚡ GPU {gpu_id} AI处理完成: {os.path.basename(input_file)} (GPU耗时 {gpu_time:.1f}s)")
+                        
+                        # 保存结果
+                        if enhanced_audio is not None:
+                            try:
+                                # 处理增强音频数据
+                                audio_data = None
+                                if isinstance(enhanced_audio, np.ndarray):
+                                    audio_data = enhanced_audio.astype(np.float32)
+                                elif hasattr(enhanced_audio, 'detach'):  # torch.Tensor
+                                    audio_data = enhanced_audio.detach().cpu().numpy().astype(np.float32)
+                                else:
+                                    audio_data = np.array(enhanced_audio, dtype=np.float32)
+                                
+                                # 处理多维数组
+                                if audio_data.ndim > 1:
+                                    if audio_data.shape[0] == 1:
+                                        audio_data = audio_data.squeeze(0)
+                                    elif audio_data.shape[1] == 1:
+                                        audio_data = audio_data.squeeze(1)
+                                    else:
+                                        audio_data = audio_data[0] if audio_data.shape[0] < audio_data.shape[1] else audio_data[:, 0]
+                                
+                                # 保存音频
+                                model_sr = 16000
+                                AudioProcessor.save_audio(audio_data, output_file, model_sr)
+                                
+                                total_time = preprocess_time + gpu_time
+                                speed_ratio = audio_duration_minutes * 60 / total_time if total_time > 0 else 0
+                                
+                                results_queue.put((True, f"成功处理: {input_file}"))
+                                
+                                # 显示处理统计和队列状态
+                                queue_size = preprocessing_queue.qsize()
+                                print(f"✅ GPU {gpu_id} 完成 {processed_count+1}/{len(file_list)}: {os.path.basename(input_file)} "
+                                      f"(音频 {audio_duration_minutes:.1f}min, 预处理 {preprocess_time:.1f}s, "
+                                      f"GPU {gpu_time:.1f}s, 速度 {speed_ratio:.1f}x, 队列 {queue_size})")
+                                
+                            except Exception as save_error:
+                                results_queue.put((False, f"保存失败 {input_file}: {save_error}"))
+                        else:
+                            results_queue.put((False, f"处理失败，无音频数据: {input_file}"))
+                            
+                    except Exception as gpu_error:
+                        results_queue.put((False, f"GPU处理失败 {input_file}: {gpu_error}"))
+                    
+                    finally:
+                        # 清理临时文件
+                        if 'temp_input_path' in locals() and os.path.exists(temp_input_path):
+                            try:
+                                os.remove(temp_input_path)
+                            except:
+                                pass
+                    
+                    processed_count += 1
+                    
+            except queue.Empty:
+                queue_size = preprocessing_queue.qsize()
+                print(f"⚠️ GPU {gpu_id}: 处理队列超时 (队列中还有 {queue_size} 个文件等待处理)")
+                if queue_size == 0:
+                    print(f"   预处理线程可能已经完成或出现错误")
+                    break
+                else:
+                    print(f"   继续等待预处理完成...")
+                    continue
+            except Exception as e:
+                print(f"🚨 GPU {gpu_id}: GPU处理线程错误: {e}")
+                break
+    
+    # 启动异步线程
+    print(f"🚀 GPU {gpu_id} 启动异步处理管道:")
+    print(f"  📥 预处理线程: 音频加载 + FFT下采样")
+    print(f"  🎯 GPU处理线程: AI模型推理 + 结果保存")
+    print(f"  📊 管道队列大小: {queue_size} (缓冲区)")
+    print(f"  🧵 GPU工作线程数: {getattr(config, 'max_workers_per_gpu', 2)}")
+    print(f"  ⏱️ GPU处理超时: {getattr(config, 'gpu_timeout_seconds', 1200)}秒")
+    
+    # 创建预处理线程
+    preprocess_thread = threading.Thread(target=preprocessing_worker, daemon=True, name=f"GPU{gpu_id}-Preprocess")
+    
+    # 根据配置创建GPU处理线程
+    max_workers = getattr(config, 'max_workers_per_gpu', 2)
+    gpu_threads = []
+    for worker_id in range(max_workers):
+        if max_workers > 1:
+            thread_name = f"GPU{gpu_id}-Processing-{worker_id}"
+        else:
+            thread_name = f"GPU{gpu_id}-Processing"
+        gpu_thread = threading.Thread(target=gpu_processing_worker, daemon=True, name=thread_name)
+        gpu_threads.append(gpu_thread)
+    
+    preprocess_thread.start()
+    for gpu_thread in gpu_threads:
+        gpu_thread.start()
+    
+    print(f"✅ GPU {gpu_id} 异步管道启动完成，开始处理文件...")
+    
+    # 创建进度条
+    pbar = tqdm(total=len(file_list), desc=f"GPU {gpu_id}", position=position, leave=True)
+    
+        # 收集结果
+    completed = 0
+    while completed < len(file_list):
+        try:
+            # 使用配置的超时时间
+            timeout_seconds = getattr(config, 'gpu_timeout_seconds', 1200)
+            result = results_queue.get(timeout=timeout_seconds)
+            results.append(result)
+            completed += 1
+            pbar.update(1)
+            
+            # 更新进度条状态
+            if result[0]:
+                pbar.set_postfix({"状态": "成功"})
+            else:
+                pbar.set_postfix({"状态": "失败"})
+                
+        except queue.Empty:
+            timeout_minutes = getattr(config, 'gpu_timeout_seconds', 1200) // 60
+            print(f"⚠️ GPU {gpu_id}: 结果收集超时 ({timeout_minutes}分钟)")
+            break
+    
+    # 等待线程完成
+    thread_timeout = getattr(config, 'thread_join_timeout_seconds', 10)
+    preprocess_thread.join(timeout=thread_timeout)
+    for gpu_thread in gpu_threads:
+        gpu_thread.join(timeout=thread_timeout)
+    
+    pbar.close()
+    
+    # 统计结果和性能
+    success_count = sum(1 for success, _ in results if success)
+    failed_count = len(results) - success_count
+    
+    print(f"\n📊 GPU {gpu_id} 异步管道处理完成:")
+    print(f"  ✅ 成功处理: {success_count} 个文件")
+    print(f"  ❌ 处理失败: {failed_count} 个文件")
+    print(f"  📈 成功率: {(success_count/len(file_list)*100):.1f}%")
+    print(f"  🔄 异步管道: 预处理线程 + GPU处理线程 并行工作")
+    
+    return results
 
 
 def process_batch_on_gpu_worker(args) -> List[Tuple[bool, str, Optional[np.ndarray]]]:
@@ -773,6 +969,9 @@ def process_batch_on_gpu_worker(args) -> List[Tuple[bool, str, Optional[np.ndarr
     # 在工作进程中初始化ClearVoice
     try:
         from clearvoice import ClearVoice
+        
+        # 强制使用设备0（在CUDA_VISIBLE_DEVICES隔离环境中）
+        torch.cuda.set_device(0)
         
         clearvoice_instance = ClearVoice(task=task, model_names=[model_name])
         
@@ -835,17 +1034,41 @@ class ProcessingStats:
         self.failed_files = 0
         self.total_duration = 0
         self.processing_time = 0.0
+        
+        # 错误分类统计
+        self.error_categories = {
+            "cuda_memory_errors": 0,      # CUDA显存不足错误
+            "system_memory_errors": 0,    # 系统内存不足错误
+            "load_errors": 0,             # 音频加载错误
+            "process_errors": 0,          # 音频处理错误
+            "save_errors": 0,             # 音频保存错误
+            "unknown_errors": 0           # 其他未知错误
+        }
     
     def update_from_results(self, results: List[Tuple[bool, str]]):
-        """从结果更新统计信息"""
+        """从结果更新统计信息（不包含跳过文件的重复计算）"""
         for success, message in results:
             if success:
-                if "跳过已存在文件" in message:
-                    self.skipped_files += 1
-                else:
+                # 跳过文件数量已经在处理前统计，这里不再重复计算
+                if "跳过已存在文件" not in message:
                     self.processed_files += 1
             else:
                 self.failed_files += 1
+                
+                # 分类错误类型
+                message_lower = message.lower()
+                if "显存不足" in message_lower or "cuda内存不足" in message_lower or "out of memory" in message_lower:
+                    self.error_categories["cuda_memory_errors"] += 1
+                elif "系统内存不足" in message_lower or "内存不足" in message_lower:
+                    self.error_categories["system_memory_errors"] += 1
+                elif "加载失败" in message_lower:
+                    self.error_categories["load_errors"] += 1
+                elif "处理失败" in message_lower:
+                    self.error_categories["process_errors"] += 1
+                elif "保存失败" in message_lower:
+                    self.error_categories["save_errors"] += 1
+                else:
+                    self.error_categories["unknown_errors"] += 1
     
     def print_summary(self, config: MossFormerGANConfig):
         """打印统计摘要"""
@@ -863,9 +1086,41 @@ class ProcessingStats:
         
         print(f"处理时间:     {self.processing_time:.2f}秒")
         
+        # 显示错误分类统计
+        if self.failed_files > 0:
+            print("\n错误分类统计:")
+            print("-" * 30)
+            
+            for error_type, count in self.error_categories.items():
+                if count > 0:
+                    error_name = {
+                        "cuda_memory_errors": "CUDA显存不足",
+                        "system_memory_errors": "系统内存不足", 
+                        "load_errors": "音频加载错误",
+                        "process_errors": "音频处理错误",
+                        "save_errors": "音频保存错误",
+                        "unknown_errors": "其他未知错误"
+                    }.get(error_type, error_type)
+                    
+                    percentage = (count / self.failed_files) * 100
+                    print(f"{error_name}:    {count} ({percentage:.1f}%)")
+            
+            # 提供针对性建议
+            print("\n💡 错误处理建议:")
+            if self.error_categories["cuda_memory_errors"] > 0:
+                print("  - CUDA显存不足：尝试处理较小的音频文件，或增加GPU显存")
+            if self.error_categories["system_memory_errors"] > 0:
+                print("  - 系统内存不足：关闭其他程序释放内存，或处理较小的文件")
+            if self.error_categories["load_errors"] > 0:
+                print("  - 音频加载错误：检查音频文件格式和完整性")
+            if self.error_categories["process_errors"] > 0:
+                print("  - 音频处理错误：检查ClearVoice模型和CUDA环境")
+            if self.error_categories["save_errors"] > 0:
+                print("  - 音频保存错误：检查输出目录权限和磁盘空间")
+        
         # 显示GPU使用情况
         if config.use_multi_gpu:
-            print(f"处理模式:     {'隔离GPU模式' if config.batch_processing_mode == 'isolated_gpu' else '多GPU模式'}")
+            print(f"\n处理模式:     {'隔离GPU模式' if config.batch_processing_mode == 'isolated_gpu' else '多GPU模式'}")
             print(f"使用GPU数:    {len(config.gpu_ids)}")
             print(f"GPU列表:      {config.gpu_ids}")
         
@@ -878,6 +1133,7 @@ class MossFormerGANBatchProcessor:
     def __init__(self, config: MossFormerGANConfig):
         self.config = config
         self.stats = ProcessingStats()
+        self.protection_strategy = LargeFileProtectionStrategy(config)  # 大文件保护策略
         
         # 检查GPU可用性
         if torch.cuda.is_available():
@@ -948,6 +1204,12 @@ class MossFormerGANBatchProcessor:
     
     def enhance_single_file(self, input_file: str, output_file: str) -> Tuple[bool, str]:
         """增强单个文件"""
+        # 获取文件大小用于错误报告
+        try:
+            file_size_mb = os.path.getsize(input_file) / (1024 * 1024)
+        except:
+            file_size_mb = 0
+            
         try:
             # 检查是否跳过已存在的文件
             if self.config.skip_existing and os.path.exists(output_file):
@@ -964,7 +1226,17 @@ class MossFormerGANBatchProcessor:
                 torch.cuda.set_device(gpu_id)
             
             # 加载音频数据
-            audio, sr = AudioProcessor.load_and_validate_audio(input_file, self.config)
+            try:
+                audio, sr = AudioProcessor.load_and_validate_audio(input_file, self.config)
+                
+                # 检查音频长度，如果太长给出警告
+                audio_duration_minutes = len(audio) / sr / 60
+                warning_duration = getattr(self.config, 'memory_warning_duration_minutes', 30.0)
+                if audio_duration_minutes > warning_duration:
+                    print(f"⚠️ 单文件处理: 文件 {os.path.basename(input_file)} 时长 {audio_duration_minutes:.1f}分钟，可能消耗大量显存")
+                    
+            except Exception as load_error:
+                return False, f"音频加载失败 {input_file} ({file_size_mb:.1f}MB): {load_error}"
             
             # 在指定GPU上处理 - 使用ClearVoice进行语音增强（文件进文件出）
             # 创建临时文件保存下采样后的音频
@@ -974,14 +1246,59 @@ class MossFormerGANBatchProcessor:
             temp_filename = f"temp_audio_gpu{gpu_id}_{int(time.time())}_{os.getpid()}_single.wav"
             temp_input_path = os.path.join(temp_dir, temp_filename)
             
+            enhanced_audio = None
             try:
                 # 保存音频到临时文件
                 sf.write(temp_input_path, audio, sr, format='WAV', subtype='PCM_16')
+                
+                # 清理音频变量释放内存
+                del audio
                 
                 # 使用ClearVoice处理临时文件（文件进文件出）
                 with torch.cuda.device(gpu_id) if gpu_id is not None else torch.no_grad():
                     enhanced_audio = clearvoice_instance(temp_input_path, online_write=False)
                     
+            except RuntimeError as cuda_error:
+                # 处理CUDA相关错误（如显存不足）
+                error_msg = str(cuda_error).lower()
+                if "out of memory" in error_msg or "cuda" in error_msg:
+                    print(f"🚨 单文件处理: CUDA内存不足，无法处理大文件 {os.path.basename(input_file)} ({file_size_mb:.1f}MB)")
+                    
+                    # 强制清理GPU内存
+                    try:
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        # 尝试创建一个小tensor来测试GPU是否恢复
+                        test_tensor = torch.tensor([1.0]).cuda()
+                        del test_tensor
+                        torch.cuda.empty_cache()
+                        print(f"✓ 单文件处理: 内存清理完成")
+                    except Exception as cleanup_error:
+                        print(f"⚠️ 单文件处理: 内存清理失败: {cleanup_error}")
+                    
+                    return False, f"显存不足，无法处理大文件 {input_file} ({file_size_mb:.1f}MB): {cuda_error}"
+                else:
+                    return False, f"CUDA处理失败 {input_file} ({file_size_mb:.1f}MB): {cuda_error}"
+                    
+            except MemoryError as mem_error:
+                # 处理内存不足错误
+                print(f"🚨 单文件处理: 系统内存不足，无法处理大文件 {os.path.basename(input_file)} ({file_size_mb:.1f}MB)")
+                
+                # 清理内存
+                try:
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                except:
+                    pass
+                    
+                return False, f"系统内存不足，无法处理大文件 {input_file} ({file_size_mb:.1f}MB): {mem_error}"
+                
+            except Exception as process_error:
+                return False, f"音频处理失败 {input_file} ({file_size_mb:.1f}MB): {process_error}"
+                
             finally:
                 # 清理临时文件
                 if os.path.exists(temp_input_path):
@@ -1034,11 +1351,36 @@ class MossFormerGANBatchProcessor:
                 return False, f"处理失败，无音频数据: {input_file}"
                 
         except Exception as e:
-            return False, f"处理失败 {input_file}: {e}"
+            # 捕获所有其他未处理的异常
+            error_msg = str(e).lower()
+            
+            if "out of memory" in error_msg or "cuda" in error_msg:
+                print(f"🚨 单文件处理: 意外的CUDA错误，无法处理文件 {os.path.basename(input_file)} ({file_size_mb:.1f}MB): {e}")
+                
+                # 尝试清理GPU内存
+                try:
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                except:
+                    pass
+                    
+                return False, f"意外CUDA错误，无法处理文件 {input_file} ({file_size_mb:.1f}MB): {e}"
+            else:
+                print(f"🚨 单文件处理: 未知错误，无法处理文件 {os.path.basename(input_file)} ({file_size_mb:.1f}MB): {e}")
+                return False, f"未知错误，无法处理文件 {input_file} ({file_size_mb:.1f}MB): {e}"
     
-    def get_audio_files(self) -> List[Tuple[str, str]]:
-        """获取所有音频文件路径"""
-        audio_files = []
+    def get_audio_files(self) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], List[Tuple[str, str]]]:
+        """
+        获取所有音频文件路径并分类
+        
+        Returns:
+            元组包含三个列表: (要处理的文件, 要跳过的文件, 所有文件)
+        """
+        all_files = []
+        files_to_process = []
+        files_to_skip = []
         
         for root, dirs, files in os.walk(self.config.input_dir):
             for file in files:
@@ -1057,9 +1399,110 @@ class MossFormerGANBatchProcessor:
                     # 立即清理输出路径，避免后续保存时出错
                     output_path = AudioProcessor._sanitize_file_path(raw_output_path)
                     
-                    audio_files.append((input_path, output_path))
+                    file_pair = (input_path, output_path)
+                    all_files.append(file_pair)
+                    
+                    # 检查输出文件是否已存在，决定是否跳过
+                    if self.config.skip_existing and os.path.exists(output_path):
+                        files_to_skip.append(file_pair)
+                    else:
+                        files_to_process.append(file_pair)
         
-        return audio_files
+        return files_to_process, files_to_skip, all_files
+    
+    def get_file_complexity_score(self, file_path: str) -> float:
+        """
+        计算文件复杂度分数（基于文件大小和时长）
+        
+        Args:
+            file_path: 音频文件路径
+            
+        Returns:
+            复杂度分数（越大越复杂）
+        """
+        try:
+            # 获取文件大小（MB）
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            
+            # 尝试获取音频时长
+            try:
+                import soundfile as sf
+                with sf.SoundFile(file_path) as f:
+                    duration_minutes = len(f) / f.samplerate / 60
+            except:
+                # 如果无法读取，基于文件大小估算（假设1MB约1分钟）
+                duration_minutes = file_size_mb
+            
+            # 复杂度分数 = 时长权重 * 时长 + 文件大小权重 * 文件大小
+            complexity_score = 0.7 * duration_minutes + 0.3 * file_size_mb
+            return complexity_score
+            
+        except Exception:
+            return 1.0  # 默认复杂度
+    
+    def distribute_files_smartly(self, file_pairs: List[Tuple[str, str]]) -> List[List[Tuple[str, str]]]:
+        """
+        智能分配文件给各个GPU，考虑文件复杂度和负载均衡
+        
+        Args:
+            file_pairs: 文件路径对列表
+            
+        Returns:
+            每个GPU分配的文件列表
+        """
+        if not self.available_gpus:
+            return []
+        
+        num_gpus = len(self.available_gpus)
+        
+        # 如果禁用动态负载均衡，使用原来的简单分配
+        if not self.config.enable_dynamic_balancing:
+            logger.info("使用简单均等分配")
+            files_per_gpu = len(file_pairs) // num_gpus
+            remainder = len(file_pairs) % num_gpus
+            
+            gpu_file_batches = []
+            start_idx = 0
+            
+            for i in range(num_gpus):
+                current_batch_size = files_per_gpu + (1 if i < remainder else 0)
+                end_idx = start_idx + current_batch_size
+                gpu_files = file_pairs[start_idx:end_idx]
+                gpu_file_batches.append(gpu_files)
+                start_idx = end_idx
+            
+            return gpu_file_batches
+        
+        # 启用智能分配
+        logger.info("使用智能负载均衡分配")
+        
+        # 计算每个文件的复杂度
+        file_complexity = []
+        for input_file, output_file in file_pairs:
+            complexity = self.get_file_complexity_score(input_file)
+            file_complexity.append((input_file, output_file, complexity))
+        
+        # 按复杂度排序（复杂的文件先分配）
+        file_complexity.sort(key=lambda x: x[2], reverse=True)
+        
+        # 初始化每个GPU的工作负载
+        gpu_workloads = [0.0] * num_gpus
+        gpu_file_lists = [[] for _ in range(num_gpus)]
+        
+        # 使用贪心算法分配文件（总是分配给当前负载最轻的GPU）
+        for input_file, output_file, complexity in file_complexity:
+            # 找到负载最轻的GPU
+            min_workload_gpu = gpu_workloads.index(min(gpu_workloads))
+            
+            # 分配文件
+            gpu_file_lists[min_workload_gpu].append((input_file, output_file))
+            gpu_workloads[min_workload_gpu] += complexity
+        
+        # 打印分配统计
+        for i, (gpu_id, workload, file_count) in enumerate(zip(self.available_gpus, gpu_workloads, [len(files) for files in gpu_file_lists])):
+            logger.info(f"GPU {gpu_id}: 分配 {file_count} 个文件，预估工作负载: {workload:.2f}")
+        
+        return gpu_file_lists
     
     def process_files_isolated_gpu(self, file_pairs: List[Tuple[str, str]]) -> List[Tuple[bool, str]]:
         """
@@ -1078,55 +1521,119 @@ class MossFormerGANBatchProcessor:
         logger.info(f"开始隔离GPU处理，文件总数: {len(file_pairs)}")
         logger.info(f"使用GPU: {self.available_gpus}")
         
-        # 打乱文件列表以实现GPU负载均衡
-        shuffled_file_pairs = file_pairs.copy()
-        random.shuffle(shuffled_file_pairs)
-        logger.info("已打乱文件列表以优化GPU负载均衡")
+        # 使用智能分配策略
+        gpu_file_lists = self.distribute_files_smartly(file_pairs)
         
-        # 将文件分配给各个GPU
-        num_gpus = len(self.available_gpus)
-        files_per_gpu = len(shuffled_file_pairs) // num_gpus
-        remainder = len(shuffled_file_pairs) % num_gpus
-        
+        # 准备GPU批次数据
         gpu_file_batches = []
-        start_idx = 0
-        
-        for i, gpu_id in enumerate(self.available_gpus):
-            # 计算当前GPU应该处理的文件数量
-            current_batch_size = files_per_gpu + (1 if i < remainder else 0)
-            end_idx = start_idx + current_batch_size
-            
-            # 分配文件给当前GPU
-            gpu_files = shuffled_file_pairs[start_idx:end_idx]
+        for i, (gpu_id, gpu_files) in enumerate(zip(self.available_gpus, gpu_file_lists)):
             gpu_file_batches.append((gpu_files, gpu_id, i))
-            
-            logger.info(f"GPU {gpu_id}: 分配 {len(gpu_files)} 个文件")
-            start_idx = end_idx
+            logger.info(f"GPU {gpu_id}: 最终分配 {len(gpu_files)} 个文件")
         
-        # 使用多进程处理
+        # ✅ 使用mp.Pool进行多进程处理，添加崩溃恢复机制
+        num_gpus = len(self.available_gpus)
         all_results = []
-        with mp.Pool(processes=num_gpus) as pool:
-            # 准备参数
-            args_list = []
-            for gpu_files, gpu_id, position in gpu_file_batches:
-                args = (
-                    gpu_files,
-                    gpu_id,
-                    self.config.model_name,
-                    self.config.task,
-                    self.config.target_sr,
-                    self.config.input_dir,
-                    self.config.output_dir,
-                    position
-                )
-                args_list.append(args)
+        failed_gpu_files = []  # 记录失败的GPU文件批次
+        
+        # 准备参数
+        args_list = []
+        for gpu_files, gpu_id, position in gpu_file_batches:
+            args = (
+                gpu_files,
+                gpu_id,
+                self.config.model_name,
+                self.config.task,
+                self.config.target_sr,
+                self.config.input_dir,
+                self.config.output_dir,
+                position,
+                self.config  # 传递完整的配置对象
+            )
+            args_list.append(args)
+        
+        max_retries = getattr(self.config, 'max_retry_attempts', 2)
+        timeout_minutes = getattr(self.config, 'process_timeout_minutes', 30)
+        
+        for retry_attempt in range(max_retries + 1):
+            if retry_attempt > 0:
+                logger.info(f"第 {retry_attempt} 次重试，处理 {len(failed_gpu_files)} 个失败的GPU批次...")
+                args_list = failed_gpu_files
+                failed_gpu_files = []
             
-            # 提交任务
-            results = pool.map(process_gpu_batch_isolated, args_list)
+            try:
+                with mp.Pool(processes=min(num_gpus, len(args_list))) as pool:
+                    logger.info(f"启动 {len(args_list)} 个独立GPU进程 (重试 {retry_attempt}/{max_retries})...")
+                    
+                    # 使用async方式提交任务，支持超时检测
+                    async_results = []
+                    for args in args_list:
+                        async_result = pool.apply_async(process_gpu_batch_isolated, (args,))
+                        async_results.append((async_result, args))
+                    
+                    # 等待结果并处理超时
+                    for async_result, args in async_results:
+                        gpu_files, gpu_id = args[0], args[1]
+                        try:
+                            # 等待结果，设置超时
+                            result_batch = async_result.get(timeout=timeout_minutes * 60)
+                            all_results.extend(result_batch)
+                            logger.info(f"✅ GPU {gpu_id} 进程完成，处理了 {len(gpu_files)} 个文件")
+                            
+                        except mp.TimeoutError:
+                            # GPU进程超时
+                            logger.error(f"🚨 GPU {gpu_id} 进程超时 ({timeout_minutes}分钟)，可能遇到大文件或内存问题")
+                            
+                            # 将失败的文件加入重试列表（如果还有重试机会）
+                            if retry_attempt < max_retries:
+                                failed_gpu_files.append(args)
+                                logger.info(f"   将GPU {gpu_id}的 {len(gpu_files)} 个文件加入重试队列")
+                            else:
+                                # 最后一次重试也失败，标记所有文件为失败
+                                for input_file, output_file in gpu_files:
+                                    all_results.append((False, f"GPU {gpu_id} 进程超时，无法处理: {input_file}"))
+                        
+                        except Exception as e:
+                            # GPU进程崩溃或其他异常
+                            logger.error(f"🚨 GPU {gpu_id} 进程异常: {e}")
+                            
+                            # 将失败的文件加入重试列表（如果还有重试机会）
+                            if retry_attempt < max_retries:
+                                failed_gpu_files.append(args)
+                                logger.info(f"   将GPU {gpu_id}的 {len(gpu_files)} 个文件加入重试队列")
+                            else:
+                                # 最后一次重试也失败，标记所有文件为失败
+                                for input_file, output_file in gpu_files:
+                                    all_results.append((False, f"GPU {gpu_id} 进程崩溃，无法处理: {input_file}"))
+                    
+                    # 强制终止池中的所有进程
+                    pool.terminate()
+                    pool.join()
+                    
+            except Exception as pool_error:
+                logger.error(f"🚨 进程池异常: {pool_error}")
+                if retry_attempt >= max_retries:
+                    # 如果是最后一次重试，将所有剩余文件标记为失败
+                    for args in args_list:
+                        gpu_files, gpu_id = args[0], args[1]
+                        for input_file, output_file in gpu_files:
+                            all_results.append((False, f"进程池异常，无法处理: {input_file}"))
             
-            # 合并结果
-            for result_batch in results:
-                all_results.extend(result_batch)
+            # 如果没有失败的GPU批次，跳出重试循环
+            if not failed_gpu_files:
+                break
+            
+            # 重试前清理GPU内存
+            if retry_attempt < max_retries:
+                logger.info(f"重试前清理系统资源...")
+                try:
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    time.sleep(5)  # 等待5秒让系统稳定
+                except:
+                    pass
         
         # 更新统计信息
         self.stats.update_from_results(all_results)
@@ -1185,6 +1692,77 @@ class MossFormerGANBatchProcessor:
         logger.warning("暂不支持的批处理模式，使用并行处理")
         return self.process_files_parallel(file_pairs)
     
+    def monitor_gpu_memory(self, gpu_id: int = None) -> Dict[str, float]:
+        """
+        监控GPU内存使用情况
+        
+        Args:
+            gpu_id: 要监控的GPU ID，如果为None则监控所有可用GPU
+            
+        Returns:
+            包含内存使用信息的字典
+        """
+        memory_info = {}
+        
+        if not torch.cuda.is_available():
+            return {"error": "CUDA不可用"}
+        
+        if gpu_id is not None:
+            gpu_ids = [gpu_id]
+        else:
+            gpu_ids = self.available_gpus
+        
+        for gid in gpu_ids:
+            try:
+                torch.cuda.set_device(gid)
+                
+                # 获取内存信息
+                total_memory = torch.cuda.get_device_properties(gid).total_memory
+                allocated_memory = torch.cuda.memory_allocated(gid)
+                reserved_memory = torch.cuda.memory_reserved(gid)
+                free_memory = total_memory - allocated_memory
+                
+                memory_info[f"GPU_{gid}"] = {
+                    "total_gb": total_memory / (1024**3),
+                    "allocated_gb": allocated_memory / (1024**3),
+                    "reserved_gb": reserved_memory / (1024**3),
+                    "free_gb": free_memory / (1024**3),
+                    "utilization_percent": (allocated_memory / total_memory) * 100
+                }
+                
+            except Exception as e:
+                memory_info[f"GPU_{gid}"] = {"error": str(e)}
+        
+        return memory_info
+    
+    def print_gpu_memory_status(self):
+        """打印GPU内存状态"""
+        memory_info = self.monitor_gpu_memory()
+        
+        print("\n" + "="*60)
+        print("GPU 内存状态监控")
+        print("="*60)
+        
+        for gpu_key, info in memory_info.items():
+            if "error" in info:
+                print(f"{gpu_key}: 错误 - {info['error']}")
+            else:
+                print(f"{gpu_key}:")
+                print(f"  总内存:     {info['total_gb']:.1f} GB")
+                print(f"  已分配:     {info['allocated_gb']:.2f} GB")
+                print(f"  已保留:     {info['reserved_gb']:.2f} GB")
+                print(f"  可用:       {info['free_gb']:.1f} GB")
+                print(f"  使用率:     {info['utilization_percent']:.1f}%")
+                
+                # 内存使用警告
+                if info['utilization_percent'] > 90:
+                    print(f"  ⚠️  内存使用过高，可能导致显存不足")
+                elif info['utilization_percent'] > 70:
+                    print(f"  ⚠️  内存使用较高，注意大文件处理")
+                print()
+        
+        print("="*60)
+    
     def test_model_functionality(self):
         """测试模型功能"""
         if not torch.cuda.is_available():
@@ -1192,6 +1770,9 @@ class MossFormerGANBatchProcessor:
             return
         
         logger.info("测试模型功能...")
+        
+        # 显示测试前的GPU内存状态
+        self.print_gpu_memory_status()
         
         # 创建一个测试音频文件
         test_audio = np.random.randn(16000).astype(np.float32)  # 1秒的随机音频
@@ -1235,14 +1816,172 @@ class MossFormerGANBatchProcessor:
             if os.path.exists(test_file):
                 os.remove(test_file)
         
+        # 显示测试后的GPU内存状态
+        self.print_gpu_memory_status()
         logger.info("模型测试完成")
+
+
+class LargeFileProtectionStrategy:
+    """大文件处理保护策略类"""
+    
+    def __init__(self, config: MossFormerGANConfig):
+        self.config = config
+        self.large_file_stats = {
+            "total_large_files": 0,
+            "skipped_by_size": 0,
+            "skipped_by_duration": 0,
+            "failed_by_memory": 0,
+            "failed_by_timeout": 0,
+            "successfully_processed": 0
+        }
+    
+    def check_file_safety(self, file_path: str) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        检查文件是否安全处理
+        
+        Returns:
+            (is_safe, reason, file_info)
+        """
+        try:
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            
+            file_info = {
+                "size_mb": file_size_mb,
+                "estimated_duration_min": file_size_mb * 0.8,  # 保守估算
+                "memory_requirement_gb": file_size_mb * 0.005,  # 粗略估算内存需求
+            }
+            
+            # 检查文件大小
+            if file_size_mb > self.config.max_file_size_mb:
+                self.large_file_stats["skipped_by_size"] += 1
+                return False, f"文件过大 ({file_size_mb:.1f}MB > {self.config.max_file_size_mb}MB)", file_info
+            
+            # 检查预估时长
+            if file_info["estimated_duration_min"] > self.config.max_audio_duration_minutes:
+                self.large_file_stats["skipped_by_duration"] += 1
+                return False, f"预估时长过长 ({file_info['estimated_duration_min']:.1f}min > {self.config.max_audio_duration_minutes}min)", file_info
+            
+            # 检查GPU内存需求
+            if torch.cuda.is_available():
+                gpu_total_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                memory_limit = gpu_total_memory_gb * getattr(self.config, 'gpu_memory_usage_limit', 0.8)
+                if file_info["memory_requirement_gb"] > memory_limit:
+                    return False, f"预估GPU内存需求过高 ({file_info['memory_requirement_gb']:.1f}GB > {memory_limit:.1f}GB)", file_info
+            
+            # 标记为大文件（但可以处理）
+            large_file_threshold = getattr(self.config, 'large_file_warning_mb', 200.0)
+            if file_size_mb > large_file_threshold:
+                self.large_file_stats["total_large_files"] += 1
+            
+            return True, "文件检查通过", file_info
+            
+        except Exception as e:
+            return False, f"文件检查失败: {e}", {}
+    
+    def get_processing_recommendations(self, file_info: Dict[str, Any]) -> List[str]:
+        """根据文件信息提供处理建议"""
+        recommendations = []
+        
+        size_mb = file_info.get("size_mb", 0)
+        
+        if size_mb > 100:
+            recommendations.append("🔍 建议使用隔离GPU模式处理大文件")
+        
+        if size_mb > 300:
+            recommendations.append("⚠️ 处理前确保GPU有足够显存 (>4GB)")
+            recommendations.append("💾 建议关闭其他GPU程序释放显存")
+        
+        if size_mb > 500:
+            recommendations.append("🚨 极大文件，建议分段处理或使用更大显存的GPU")
+            recommendations.append("⏰ 预计处理时间较长，请耐心等待")
+        
+        return recommendations
+    
+    def handle_memory_error(self, file_path: str, error_type: str) -> str:
+        """处理内存错误，返回处理建议"""
+        file_size_mb = 0
+        try:
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        except:
+            pass
+        
+        suggestions = []
+        
+        if error_type == "cuda_memory":
+            self.large_file_stats["failed_by_memory"] += 1
+            suggestions.extend([
+                f"🚨 GPU显存不足，无法处理 {file_size_mb:.1f}MB 大文件",
+                "💡 建议解决方案:",
+                "   1. 使用显存更大的GPU (建议>8GB)",
+                "   2. 关闭其他占用GPU的程序",
+                "   3. 将文件分割成较小片段处理",
+                "   4. 调整配置降低max_file_size_mb限制"
+            ])
+        
+        elif error_type == "system_memory":
+            self.large_file_stats["failed_by_memory"] += 1
+            suggestions.extend([
+                f"🚨 系统内存不足，无法处理 {file_size_mb:.1f}MB 大文件",
+                "💡 建议解决方案:",
+                "   1. 增加系统内存 (建议>16GB)",
+                "   2. 关闭其他占用内存的程序",
+                "   3. 重启系统清理内存",
+                "   4. 使用内存更大的服务器"
+            ])
+        
+        elif error_type == "timeout":
+            self.large_file_stats["failed_by_timeout"] += 1
+            suggestions.extend([
+                f"🚨 处理超时，{file_size_mb:.1f}MB 文件耗时过长",
+                "💡 建议解决方案:",
+                "   1. 增加process_timeout_minutes配置值",
+                "   2. 使用更快的GPU (如RTX 4090, A100等)",
+                "   3. 检查文件是否损坏",
+                "   4. 考虑分段处理长音频"
+            ])
+        
+        return "\n".join(suggestions)
+    
+    def print_protection_summary(self):
+        """打印保护策略执行摘要"""
+        if self.large_file_stats["total_large_files"] == 0:
+            return
+        
+        print("\n" + "="*60)
+        print("🛡️ 大文件保护策略执行摘要")
+        print("="*60)
+        
+        total = self.large_file_stats["total_large_files"]
+        skipped_size = self.large_file_stats["skipped_by_size"]
+        skipped_duration = self.large_file_stats["skipped_by_duration"]
+        failed_memory = self.large_file_stats["failed_by_memory"]
+        failed_timeout = self.large_file_stats["failed_by_timeout"]
+        successful = self.large_file_stats["successfully_processed"]
+        
+        print(f"检测到大文件总数: {total}")
+        print(f"按大小跳过:       {skipped_size} 个 (>{self.config.max_file_size_mb}MB)")
+        print(f"按时长跳过:       {skipped_duration} 个 (>{self.config.max_audio_duration_minutes}min)")
+        print(f"内存不足失败:     {failed_memory} 个")
+        print(f"处理超时失败:     {failed_timeout} 个")
+        print(f"成功处理:         {successful} 个")
+        
+        if skipped_size + skipped_duration + failed_memory + failed_timeout > 0:
+            print(f"\n💡 优化建议:")
+            if skipped_size > 0:
+                print(f"   - 考虑提高max_file_size_mb限制 (当前{self.config.max_file_size_mb}MB)")
+            if failed_memory > 0:
+                print(f"   - 使用更大显存的GPU或增加系统内存")
+            if failed_timeout > 0:
+                print(f"   - 增加process_timeout_minutes配置 (当前{self.config.process_timeout_minutes}min)")
+        
+        print("="*60)
 
 
 class SystemDiagnostics:
     """系统诊断类"""
     
     @staticmethod
-    def diagnose_performance():
+    def diagnose_performance(config=None):
         """诊断系统性能并提供优化建议"""
         print("\n" + "=" * 60)
         print("性能诊断")
@@ -1287,12 +2026,118 @@ class SystemDiagnostics:
         print("  - ClearVoice模型支持实时语音增强")
         print("  - 调整batch_size以优化内存使用")
         print("  - 使用多进程模式避免GIL限制")
+        
+        print("\n🛡️ 大文件保护机制:")
+        if config is not None:
+            print(f"  - 自动跳过超大文件(>{config.max_file_size_mb}MB或>{config.max_audio_duration_minutes}分钟)")
+            print("  - GPU内存实时监控，不足时自动清理")
+            print(f"  - 进程崩溃自动重试(最多{config.max_retry_attempts}次)")
+            print(f"  - 进程超时保护({config.process_timeout_minutes}分钟)")
+            print(f"  - 单文件处理超时保护({config.gpu_timeout_seconds//60}分钟)")
+        else:
+            print("  - 自动跳过超大文件")
+            print("  - GPU内存实时监控，不足时自动清理")
+            print("  - 进程崩溃自动重试")
+            print("  - 进程超时保护")
+            print("  - 单文件处理超时保护")
         print("=" * 60)
 
 
 def create_default_config() -> MossFormerGANConfig:
     """创建默认配置"""
     return MossFormerGANConfig()
+
+
+def display_file_processing_status(files_to_process: List[Tuple[str, str]], 
+                                   files_to_skip: List[Tuple[str, str]], 
+                                   max_display: int = 10,
+                                   config: MossFormerGANConfig = None):
+    """
+    显示文件处理状态
+    
+    Args:
+        files_to_process: 要处理的文件列表
+        files_to_skip: 要跳过的文件列表
+        max_display: 最大显示文件数量
+    """
+    print("\n" + "=" * 80)
+    print("文件处理状态")
+    print("=" * 80)
+    
+    # 显示要处理的文件
+    if files_to_process:
+        print(f"\n📋 要处理的文件 ({len(files_to_process)} 个):")
+        print("-" * 50)
+        for i, (input_file, output_file) in enumerate(files_to_process[:max_display]):
+            rel_input = os.path.relpath(input_file)
+            rel_output = os.path.relpath(output_file)
+            print(f"  {i+1:2d}. {rel_input}")
+            print(f"      -> {rel_output}")
+        
+        if len(files_to_process) > max_display:
+            print(f"      ... 还有 {len(files_to_process) - max_display} 个文件")
+    else:
+        print("\n📋 要处理的文件: 无")
+    
+    # 显示要跳过的文件
+    if files_to_skip:
+        print(f"\n⏭️  要跳过的文件 ({len(files_to_skip)} 个):")
+        print("-" * 50)
+        for i, (input_file, output_file) in enumerate(files_to_skip[:max_display]):
+            rel_input = os.path.relpath(input_file)
+            rel_output = os.path.relpath(output_file)
+            print(f"  {i+1:2d}. {rel_input} (已存在)")
+            print(f"      -> {rel_output}")
+        
+        if len(files_to_skip) > max_display:
+            print(f"      ... 还有 {len(files_to_skip) - max_display} 个文件")
+    else:
+        print("\n⏭️  要跳过的文件: 无")
+    
+    # 显示总结
+    total_files = len(files_to_process) + len(files_to_skip)
+    print(f"\n📊 文件统计:")
+    print(f"   总文件数: {total_files}")
+    print(f"   需处理:   {len(files_to_process)}")
+    print(f"   跳过:     {len(files_to_skip)}")
+    
+    if total_files > 0:
+        process_rate = (len(files_to_process) / total_files) * 100
+        print(f"   处理率:   {process_rate:.1f}%")
+    
+    # 如果有跳过的文件，提示用户如何重新处理
+    if files_to_skip:
+        print(f"\n💡 提示: 如需重新处理已存在的文件，请修改配置:")
+        print(f"   在第92行将 skip_existing 改为 False")
+    
+    # 大文件处理警告和建议
+    large_files = []
+    for input_file, output_file in files_to_process:
+        try:
+            file_size_mb = os.path.getsize(input_file) / (1024 * 1024)
+            large_file_threshold = getattr(config, 'large_file_warning_mb', 200.0)
+            if file_size_mb > large_file_threshold:
+                large_files.append((input_file, file_size_mb))
+        except:
+            pass
+    
+    if large_files:
+        large_file_threshold = getattr(config, 'large_file_warning_mb', 200.0)
+        print(f"\n⚠️ 检测到 {len(large_files)} 个大文件 (>{large_file_threshold}MB):")
+        print("=" * 50)
+        for i, (file_path, size_mb) in enumerate(large_files[:5]):  # 只显示前5个
+            print(f"   {i+1}. {os.path.basename(file_path)} ({size_mb:.1f}MB)")
+        if len(large_files) > 5:
+            print(f"   ... 还有 {len(large_files)-5} 个大文件")
+        
+        print(f"\n🛡️ 大文件保护策略已启用:")
+        print(f"   ✓ 自动跳过超大文件 (>{config.max_file_size_mb}MB或>{config.max_audio_duration_minutes}分钟)")
+        print(f"   ✓ GPU内存实时监控和自动清理")
+        print(f"   ✓ 进程崩溃自动重试 (最多2次)")
+        print(f"   ✓ 进程/文件处理超时保护")
+        print(f"   ✓ 详细错误分类和处理建议")
+    
+    print("=" * 80)
 
 
 def main():
@@ -1305,7 +2150,7 @@ def main():
         config = create_default_config()
         
         # 性能诊断
-        SystemDiagnostics.diagnose_performance()
+        SystemDiagnostics.diagnose_performance(config)
         
         # 创建输出目录
         os.makedirs(config.output_dir, exist_ok=True)
@@ -1319,14 +2164,19 @@ def main():
         
         # 获取所有音频文件
         print("扫描音频文件...")
-        audio_files = processor.get_audio_files()
+        files_to_process, files_to_skip, all_files = processor.get_audio_files()
         
-        if not audio_files:
-            print("未找到任何音频文件")
-            return
+        # 显示文件处理状态
+        display_file_processing_status(files_to_process, files_to_skip, config=config)
         
-        processor.stats.total_files = len(audio_files)
-        print(f"找到 {len(audio_files)} 个音频文件")
+        # 检查是否有文件需要处理
+        if not files_to_process:
+            print("没有文件需要处理，程序结束")
+            return 0
+        
+        processor.stats.total_files = len(files_to_process) + len(files_to_skip)
+        processor.stats.skipped_files = len(files_to_skip)  # 预设跳过的文件数量
+        print(f"找到 {len(files_to_process)} 个音频文件需要处理，{len(files_to_skip)} 个文件已跳过")
         
         # 显示配置信息
         print(f"\n配置信息:")
@@ -1341,6 +2191,37 @@ def main():
         print(f"并行模式: {'多进程' if config.use_multiprocess else '多线程'}")
         print(f"批处理大小: {config.batch_size}")
         print(f"目标采样率: {config.target_sr}Hz")
+        print(f"异步处理管道: {'启用' if config.enable_async_pipeline else '禁用'}")
+        print(f"管道队列大小: {config.pipeline_queue_size} (预处理缓冲)")
+        print(f"每GPU工作线程: {config.max_workers_per_gpu}")
+        print(f"GPU处理超时: {config.gpu_timeout_seconds}秒")
+        print(f"FFT下采样: {'启用' if config.use_fft_downsample else '禁用'}")
+        print(f"🛡️ 大文件保护: 单文件限制 {config.max_file_size_mb}MB / {config.max_audio_duration_minutes}分钟")
+        print(f"🔄 进程恢复: {'启用' if config.enable_process_recovery else '禁用'} (最多重试{config.max_retry_attempts}次)")
+        print(f"⏱️ 进程超时: {config.process_timeout_minutes}分钟")
+        
+        # 根据GPU显存给出配置建议
+        if torch.cuda.is_available():
+            gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            print(f"\n💡 根据您的GPU显存 ({gpu_memory_gb:.1f}GB) 的配置建议:")
+            
+            if gpu_memory_gb >= 24:  # 高端GPU (如A100, RTX 4090)
+                print(f"   🚀 高端GPU配置: 可处理更大文件")
+                print(f"   建议配置: max_file_size_mb=1000, max_audio_duration_minutes=120")
+            elif gpu_memory_gb >= 12:  # 中高端GPU (如RTX 3080Ti, 4070Ti)
+                print(f"   ⚡ 中高端GPU配置: 当前配置适中")
+                print(f"   建议配置: max_file_size_mb=800, max_audio_duration_minutes=90")
+            elif gpu_memory_gb >= 8:  # 中端GPU (如RTX 3070, 4060Ti)
+                print(f"   ✅ 中端GPU配置: 当前配置合理")
+                print(f"   建议配置: max_file_size_mb=500, max_audio_duration_minutes=60 (当前设置)")
+            elif gpu_memory_gb >= 4:  # 入门GPU (如GTX 1660, RTX 3050)
+                print(f"   ⚠️ 入门GPU配置: 建议降低限制")
+                print(f"   建议配置: max_file_size_mb=200, max_audio_duration_minutes=30")
+            else:  # 低端GPU
+                print(f"   🔴 低端GPU配置: 建议显著降低限制")
+                print(f"   建议配置: max_file_size_mb=100, max_audio_duration_minutes=15")
+            
+            print(f"   📝 修改方法: 在配置类 (第110-116行) 中调整相应参数")
         
         # 开始处理
         print("\n开始批量处理...")
@@ -1349,10 +2230,10 @@ def main():
         # 选择处理方式
         if config.use_parallel:
             print("使用并行处理模式...")
-            results = processor.process_files_parallel(audio_files)
+            results = processor.process_files_parallel(files_to_process)
         else:
             print("使用批处理模式...")
-            results = processor.process_files_batch(audio_files)
+            results = processor.process_files_batch(files_to_process)
         
         # 记录处理时间
         processor.stats.processing_time = time.time() - start_time
@@ -1360,14 +2241,85 @@ def main():
         # 显示结果
         processor.stats.print_summary(config)
         
-        # 显示失败的文件
+        # 显示大文件保护策略摘要
+        processor.protection_strategy.print_protection_summary()
+        
+        # 显示失败的文件和处理建议
         failed_files = [message for success, message in results if not success]
         if failed_files:
-            print(f"\n失败的文件 ({len(failed_files)}):")
-            for i, message in enumerate(failed_files[:10]):  # 只显示前10个
-                print(f"  {i+1}. {message}")
-            if len(failed_files) > 10:
-                print(f"  ... 还有 {len(failed_files)-10} 个失败的文件")
+            print(f"\n❌ 失败的文件 ({len(failed_files)}):")
+            print("-" * 60)
+            
+            # 分类错误类型
+            memory_errors = []
+            timeout_errors = []
+            large_file_errors = []
+            other_errors = []
+            
+            for message in failed_files:
+                message_lower = message.lower()
+                if "显存不足" in message_lower or "内存不足" in message_lower or "out of memory" in message_lower:
+                    memory_errors.append(message)
+                elif "超时" in message_lower or "timeout" in message_lower:
+                    timeout_errors.append(message)
+                elif "文件过大" in message_lower or "时长过长" in message_lower:
+                    large_file_errors.append(message)
+                else:
+                    other_errors.append(message)
+            
+            # 显示分类错误
+            if memory_errors:
+                print(f"\n🚨 内存相关错误 ({len(memory_errors)} 个):")
+                for i, message in enumerate(memory_errors[:5]):
+                    print(f"   {i+1}. {message}")
+                if len(memory_errors) > 5:
+                    print(f"   ... 还有 {len(memory_errors)-5} 个内存错误")
+                    
+                print(f"\n💡 内存错误解决建议:")
+                print(f"   • 使用更大显存的GPU (推荐 ≥8GB)")
+                print(f"   • 关闭其他占用GPU/内存的程序")
+                print(f"   • 降低配置中的max_file_size_mb限制")
+                print(f"   • 将大音频文件分割成小段处理")
+            
+            if timeout_errors:
+                print(f"\n⏰ 超时错误 ({len(timeout_errors)} 个):")
+                for i, message in enumerate(timeout_errors[:5]):
+                    print(f"   {i+1}. {message}")
+                if len(timeout_errors) > 5:
+                    print(f"   ... 还有 {len(timeout_errors)-5} 个超时错误")
+                    
+                print(f"\n💡 超时错误解决建议:")
+                print(f"   • 增加配置中的process_timeout_minutes (当前{config.process_timeout_minutes}分钟)")
+                print(f"   • 使用更快的GPU硬件")
+                print(f"   • 检查音频文件是否损坏")
+                print(f"   • 考虑分批处理大文件")
+            
+            if large_file_errors:
+                print(f"\n📏 大文件错误 ({len(large_file_errors)} 个):")
+                for i, message in enumerate(large_file_errors[:5]):
+                    print(f"   {i+1}. {message}")
+                if len(large_file_errors) > 5:
+                    print(f"   ... 还有 {len(large_file_errors)-5} 个大文件错误")
+                    
+                print(f"\n💡 大文件错误解决建议:")
+                print(f"   • 提高配置中的max_file_size_mb限制 (当前{config.max_file_size_mb}MB)")
+                print(f"   • 提高配置中的max_audio_duration_minutes限制 (当前{config.max_audio_duration_minutes}分钟)")
+                print(f"   • 使用专业音频处理服务器")
+                print(f"   • 考虑音频压缩或重采样预处理")
+            
+            if other_errors:
+                print(f"\n❓ 其他错误 ({len(other_errors)} 个):")
+                for i, message in enumerate(other_errors[:5]):
+                    print(f"   {i+1}. {message}")
+                if len(other_errors) > 5:
+                    print(f"   ... 还有 {len(other_errors)-5} 个其他错误")
+            
+            print(f"\n🔧 通用恢复步骤:")
+            print(f"   1. 重启程序清理内存缓存")
+            print(f"   2. 检查输入文件的完整性")
+            print(f"   3. 调整保护策略配置参数")
+            print(f"   4. 考虑升级硬件配置")
+            print(f"   5. 分批处理减少单次负载")
         
         print("\n处理完成！")
         
