@@ -159,6 +159,7 @@ while [[ $# -gt 0 ]]; do
             echo "                                    Chinese_English_Scripted_Speech_Corpus_Children"
             echo "                                    King-ASR-EN-Kid"
             echo "                                    speechocean762"
+            echo "                               注意: 现在使用mtfaa和mossformer增强方法"
             echo "  --max_degradation <数值>      最大CER退化量，超过此值才回退到原音频"
             echo "  --min_improvement <数值>      (已弃用) 使用--max_degradation代替"
             echo "  --num_gpus <数量>             使用的GPU数量 (默认: 自动检测)"

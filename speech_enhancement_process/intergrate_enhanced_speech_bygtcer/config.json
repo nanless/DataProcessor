@@ -30,14 +30,14 @@
             "language": "en",
             "enhancement_methods": [
                 {
-                    "name": "zipenhancer",
-                    "use_ten_vad_volume_matching": true,
-                    "description": "ZIP增强器，使用TEN-VAD音量匹配"
+                    "name": "mtfaa",
+                    "use_ten_vad_volume_matching": false,
+                    "description": "MTFAA增强器，不使用音量匹配"
                 },
                 {
                     "name": "mossformer",
                     "use_ten_vad_volume_matching": false,
-                    "description": "MossFormer增强器，不使用TEN-VAD音量匹配"
+                    "description": "MossFormer增强器，不使用音量匹配"
                 }
             ],
             "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/King-ASR-EN-Kid_integrated_by_groundtruth"
@@ -50,14 +50,14 @@
             "language": "en",
             "enhancement_methods": [
                 {
-                    "name": "zipenhancer",
-                    "use_ten_vad_volume_matching": true,
-                    "description": "ZIP增强器，使用TEN-VAD音量匹配"
+                    "name": "mtfaa",
+                    "use_ten_vad_volume_matching": false,
+                    "description": "MTFAA增强器，不使用音量匹配"
                 },
                 {
                     "name": "mossformer",
                     "use_ten_vad_volume_matching": false,
-                    "description": "MossFormer增强器，直接复制不做音量匹配"
+                    "description": "MossFormer增强器，不使用音量匹配"
                 }
             ],
             "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/speechocean762_integrated_by_groundtruth"
@@ -70,14 +70,14 @@
             "language": "zh",
             "enhancement_methods": [
                 {
-                    "name": "zipenhancer",
-                    "use_ten_vad_volume_matching": true,
-                    "description": "ZIP增强器，使用TEN-VAD音量匹配"
+                    "name": "mtfaa",
+                    "use_ten_vad_volume_matching": false,
+                    "description": "MTFAA增强器，不使用音量匹配"
                 },
                 {
                     "name": "mossformer",
                     "use_ten_vad_volume_matching": false,
-                    "description": "MossFormer增强器，不使用TEN-VAD音量匹配"
+                    "description": "MossFormer增强器，不使用音量匹配"
                 }
             ],
             "output_dir": "/root/group-shared/voiceprint/data/speech/speaker_verification/BAAI-ChildMandarin41.25H_integrated_by_groundtruth"
@@ -90,9 +90,9 @@
             "language": "mixed",
             "enhancement_methods": [
                 {
-                    "name": "zipenhancer",
-                    "use_ten_vad_volume_matching": true,
-                    "description": "ZIP增强器，使用TEN-VAD音量匹配"
+                    "name": "mtfaa",
+                    "use_ten_vad_volume_matching": false,
+                    "description": "MTFAA增强器，不使用音量匹配"
                 },
                 {
                     "name": "mossformer",

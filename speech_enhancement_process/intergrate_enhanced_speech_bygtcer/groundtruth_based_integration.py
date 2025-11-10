@@ -320,10 +320,16 @@ class GroundtruthBasedProcessor:
         
         # 构建降噪音频路径
         enhanced_dir = base_dir.parent / f"{base_dir.name}_{method_name}_enhanced"
-        enhanced_path = enhanced_dir / original_rel_path.with_suffix('.wav')
         
-        if enhanced_path.exists():
-            return str(enhanced_path)
+        # 尝试查找.wav文件
+        enhanced_path_wav = enhanced_dir / original_rel_path.with_suffix('.wav')
+        if enhanced_path_wav.exists():
+            return str(enhanced_path_wav)
+        
+        # 尝试查找.WAV文件（大写扩展名）
+        enhanced_path_WAV = enhanced_dir / original_rel_path.with_suffix('.WAV')
+        if enhanced_path_WAV.exists():
+            return str(enhanced_path_WAV)
         
         return None
         
@@ -522,9 +528,10 @@ class GroundtruthBasedProcessor:
             
             # 定义增强方法优先级（在CER相等时使用）
             method_priority = {
-                'mossformer': 1,      # 最高优先级
-                'zipenhancer': 2,     # 第二优先级
-                'resemble': 3,        # 第三优先级
+                'mtfaa': 0,           # 最高优先级
+                'mossformer': 1,      # 第二优先级
+                'zipenhancer': 2,     # 第三优先级（已弃用）
+                'resemble': 3,        # 第四优先级
             }
             
             for method in self.dataset_config['enhancement_methods']:
