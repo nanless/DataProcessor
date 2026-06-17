@@ -76,8 +76,8 @@ class MossFormerGANConfig:
     """MossFormerGAN配置类"""
     
     # 路径配置
-    input_dir: str = "/root/code/github_repos/DataCrawler/ximalaya_downloader/downloads"
-    output_dir: str = "/root/code/github_repos/DataCrawler/ximalaya_downloader/downloads_mossformer_enhanced"
+    input_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/aidatatang_200zh"
+    output_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/aidatatang_200zh_mossformergan_enhanced"
     
     # 模型配置
     model_name: str = "MossFormerGAN_SE_16K"
@@ -109,17 +109,17 @@ class MossFormerGANConfig:
     max_audio_duration_minutes: float = 120.0  # 单文件最大时长限制(分钟)
     enable_process_recovery: bool = True  # 启用进程崩溃恢复
     max_retry_attempts: int = 2  # 最大重试次数
-    process_timeout_minutes: int = 60  # 单个进程超时时间(分钟)
+    process_timeout_minutes: int = 600  # 单个进程超时时间(分钟)
     skip_large_files: bool = True  # 跳过超大文件
     
     # 异步处理管道配置
     enable_async_pipeline: bool = True  # 启用异步处理管道
-    pipeline_queue_size: int = 2  # 管道队列大小（预处理缓冲区）
-    max_workers_per_gpu: int = 2  # 每个GPU的工作线程数
+    pipeline_queue_size: int = 8  # 管道队列大小（预处理缓冲区）
+    max_workers_per_gpu: int = 3  # 每个GPU的工作线程数
     gpu_timeout_seconds: int = 1800  # GPU处理超时时间（秒）
     
     # 动态负载均衡参数
-    enable_dynamic_balancing: bool = True  # 启用动态负载均衡
+    enable_dynamic_balancing: bool = False  # 禁用动态负载均衡（大规模文件时复杂度计算开销过大）
     initial_batch_ratio: float = 0.3  # 初始批次比例（30%文件先分配）
     fast_gpu_bonus_ratio: float = 1.5  # 快速GPU奖励比例
     
@@ -487,10 +487,7 @@ def process_gpu_batch_isolated(args) -> List[Tuple[bool, str]]:
     file_list, gpu_id, model_name, task, target_sr, input_dir, output_dir, position, config = args
     
     try:
-        # 强制设置GPU设备 - 完全隔离
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-        
-        # 重新导入所需库
+        # CUDA_VISIBLE_DEVICES 已在子进程启动前设置，模块导入时 CUDA 只看到 1 张卡
         import torch
         import numpy as np
         import soundfile as sf
@@ -498,30 +495,24 @@ def process_gpu_batch_isolated(args) -> List[Tuple[bool, str]]:
         import threading
         import queue
         import tempfile
-        
-        # 等待一小段时间让CUDA正确初始化
         import time
-        time.sleep(1)
         
-        # 设置线程数
+        time.sleep(1)
         torch.set_num_threads(8)
         
-        # 验证CUDA可用性并初始化
         if not torch.cuda.is_available():
             print(f"GPU {gpu_id} 进程: CUDA不可用")
             return [(False, "CUDA不可用") for _ in file_list]
         
-        # 现在GPU 0对应于实际的指定GPU
         device_count = torch.cuda.device_count()
         if device_count == 0:
             print(f"GPU {gpu_id} 进程: 没有检测到GPU设备")
             return [(False, "没有检测到GPU设备") for _ in file_list]
         
-        # 设置设备并清空缓存
+        # 在 CUDA_VISIBLE_DEVICES 隔离后, cuda:0 即为指定物理 GPU
         torch.cuda.set_device(0)
         torch.cuda.empty_cache()
         
-        # 验证设备信息
         try:
             current_device = torch.cuda.current_device()
             device_name = torch.cuda.get_device_name(0)
@@ -536,10 +527,8 @@ def process_gpu_batch_isolated(args) -> List[Tuple[bool, str]]:
             return [(False, f"获取设备信息失败: {e}") for _ in file_list]
 
         
-        # 启用异步处理管道
         print(f"GPU {gpu_id} 启用异步处理管道")
         
-        # 创建异步处理管道
         return process_with_async_pipeline(
             file_list, gpu_id, model_name, task, target_sr, position, config
         )
@@ -574,14 +563,11 @@ def process_with_async_pipeline(file_list, gpu_id, model_name, task, target_sr, 
     import time
     from types import SimpleNamespace
     
-    # 获取配置参数，如果没有传入则使用默认值
     if config is None:
-        # 创建默认配置参数
-        from types import SimpleNamespace
         config = SimpleNamespace()
         config.pipeline_queue_size = 1
         config.max_workers_per_gpu = 2
-        config.gpu_timeout_seconds = 600  # 使用配置类的默认值
+        config.gpu_timeout_seconds = 600
         config.use_fft_downsample = True
         config.fft_downsample_quality = "high"
         config.anti_alias_filter = True
@@ -597,10 +583,13 @@ def process_with_async_pipeline(file_list, gpu_id, model_name, task, target_sr, 
     try:
         from clearvoice import ClearVoice
         
-        # 强制使用设备0（在CUDA_VISIBLE_DEVICES隔离环境中）
         torch.cuda.set_device(0)
         
-        # 创建ClearVoice实例
+        # ClearVoice 通过 nvidia-smi 探测空闲 GPU，不认 CUDA_VISIBLE_DEVICES
+        # 需 monkey-patch 使其始终使用 cuda:0
+        import clearvoice.networks as _cvn
+        _cvn.SpeechModel.get_free_gpu = lambda self: 0 if torch.cuda.is_available() else None
+        
         clearvoice_instance = ClearVoice(task=task, model_names=[model_name])
         
         print(f"GPU {gpu_id} 模型加载成功，开始异步处理 {len(file_list)} 个文件")
@@ -740,10 +729,10 @@ def process_with_async_pipeline(file_list, gpu_id, model_name, task, target_sr, 
                     _, i, input_file, output_file, temp_input_path, audio_duration_minutes, preprocess_time = item
                     
                     try:
-                        # GPU内存检查 - AI处理前
+                        # GPU内存检查 - AI处理前（cuda:0 即为当前 GPU）
                         if torch.cuda.is_available():
-                            gpu_mem_before = torch.cuda.memory_allocated(0) / (1024**3)  # GB
-                            gpu_mem_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+                            gpu_mem_before = torch.cuda.memory_allocated(0) / (1024**3)
+                            gpu_mem_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
                             gpu_mem_free = gpu_mem_total - gpu_mem_before
                             
                             # 如果可用内存不足，先清理缓存
@@ -1530,11 +1519,6 @@ class MossFormerGANBatchProcessor:
             gpu_file_batches.append((gpu_files, gpu_id, i))
             logger.info(f"GPU {gpu_id}: 最终分配 {len(gpu_files)} 个文件")
         
-        # ✅ 使用mp.Pool进行多进程处理，添加崩溃恢复机制
-        num_gpus = len(self.available_gpus)
-        all_results = []
-        failed_gpu_files = []  # 记录失败的GPU文件批次
-        
         # 准备参数
         args_list = []
         for gpu_files, gpu_id, position in gpu_file_batches:
@@ -1551,92 +1535,104 @@ class MossFormerGANBatchProcessor:
             )
             args_list.append(args)
         
-        max_retries = getattr(self.config, 'max_retry_attempts', 2)
+        # 使用 subprocess.Popen 启动完全独立的进程，确保 CUDA_VISIBLE_DEVICES 在模块导入前生效
+        import tempfile, pickle, subprocess
+        
+        num_gpus = len(self.available_gpus)
+        all_results = []
+        
+        logger.info(f"启动 {len(args_list)} 个独立GPU进程...")
+        
+        processes = []
+        for idx, args in enumerate(args_list):
+            gpu_id = args[1]
+            gpu_files = args[0]
+            
+            # 保存参数到临时文件
+            args_file = tempfile.mkstemp(suffix='.pkl', prefix=f'moss_args_gpu{gpu_id}_')[1]
+            with open(args_file, 'wb') as f:
+                pickle.dump(args, f)
+            
+            result_file = tempfile.mkstemp(suffix='.pkl', prefix=f'moss_result_gpu{gpu_id}_')[1]
+            log_file = f"/tmp/mossformergan_gpu{gpu_id}.log"
+            
+            # 将子进程代码写入临时脚本文件
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            child_script = f'''
+import os, sys, pickle
+sys.path.insert(0, "{base_dir}")
+
+log_f = open("{log_file}", 'w')
+sys.stdout = log_f
+sys.stderr = log_f
+
+import speech_enhancement_process.mossformergan_batch_inference as _mb
+import __main__ as _main
+for _attr in dir(_mb):
+    if not _attr.startswith('_') and _attr[0].isupper():
+        try:
+            setattr(_main, _attr, getattr(_mb, _attr))
+        except:
+            pass
+
+with open("{args_file}", 'rb') as f:
+    args = pickle.load(f)
+
+results = _mb.process_gpu_batch_isolated(args)
+
+with open("{result_file}", 'wb') as f:
+    pickle.dump(results, f)
+
+log_f.close()
+'''
+            child_script_file = tempfile.mkstemp(suffix='.py', prefix=f'moss_worker_gpu{gpu_id}_')[1]
+            with open(child_script_file, 'w') as f:
+                f.write(child_script)
+            
+            logger.info(f"  启动 GPU {gpu_id} 进程 ({idx+1}/{len(args_list)}), {len(gpu_files)} 文件, log={log_file}")
+            env = os.environ.copy()
+            env.pop('http_proxy', None)
+            env.pop('https_proxy', None)
+            env.pop('HTTP_PROXY', None)
+            env.pop('HTTPS_PROXY', None)
+            env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+            
+            p = subprocess.Popen(
+                ['python', '-u', child_script_file],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env
+            )
+            # 存储以便后续等待和清理
+            processes.append((gpu_id, p, args_file, result_file, log_file, child_script_file))
+            time.sleep(5)
+        
+        # 收集结果 — 每个 GPU 重置超时，不累计
         timeout_minutes = getattr(self.config, 'process_timeout_minutes', 30)
         
-        for retry_attempt in range(max_retries + 1):
-            if retry_attempt > 0:
-                logger.info(f"第 {retry_attempt} 次重试，处理 {len(failed_gpu_files)} 个失败的GPU批次...")
-                args_list = failed_gpu_files
-                failed_gpu_files = []
-            
+        for gpu_id, p, args_file, result_file, log_file, child_script_file in processes:
+            remaining = timeout_minutes * 60
             try:
-                with mp.Pool(processes=min(num_gpus, len(args_list))) as pool:
-                    logger.info(f"启动 {len(args_list)} 个独立GPU进程 (重试 {retry_attempt}/{max_retries})...")
-                    
-                    # 使用async方式提交任务，支持超时检测
-                    async_results = []
-                    for args in args_list:
-                        async_result = pool.apply_async(process_gpu_batch_isolated, (args,))
-                        async_results.append((async_result, args))
-                    
-                    # 等待结果并处理超时
-                    for async_result, args in async_results:
-                        gpu_files, gpu_id = args[0], args[1]
-                        try:
-                            # 等待结果，设置超时
-                            result_batch = async_result.get(timeout=timeout_minutes * 60)
-                            all_results.extend(result_batch)
-                            logger.info(f"✅ GPU {gpu_id} 进程完成，处理了 {len(gpu_files)} 个文件")
-                            
-                        except mp.TimeoutError:
-                            # GPU进程超时
-                            logger.error(f"🚨 GPU {gpu_id} 进程超时 ({timeout_minutes}分钟)，可能遇到大文件或内存问题")
-                            
-                            # 将失败的文件加入重试列表（如果还有重试机会）
-                            if retry_attempt < max_retries:
-                                failed_gpu_files.append(args)
-                                logger.info(f"   将GPU {gpu_id}的 {len(gpu_files)} 个文件加入重试队列")
-                            else:
-                                # 最后一次重试也失败，标记所有文件为失败
-                                for input_file, output_file in gpu_files:
-                                    all_results.append((False, f"GPU {gpu_id} 进程超时，无法处理: {input_file}"))
-                        
-                        except Exception as e:
-                            # GPU进程崩溃或其他异常
-                            logger.error(f"🚨 GPU {gpu_id} 进程异常: {e}")
-                            
-                            # 将失败的文件加入重试列表（如果还有重试机会）
-                            if retry_attempt < max_retries:
-                                failed_gpu_files.append(args)
-                                logger.info(f"   将GPU {gpu_id}的 {len(gpu_files)} 个文件加入重试队列")
-                            else:
-                                # 最后一次重试也失败，标记所有文件为失败
-                                for input_file, output_file in gpu_files:
-                                    all_results.append((False, f"GPU {gpu_id} 进程崩溃，无法处理: {input_file}"))
-                    
-                    # 强制终止池中的所有进程
-                    pool.terminate()
-                    pool.join()
-                    
-            except Exception as pool_error:
-                logger.error(f"🚨 进程池异常: {pool_error}")
-                if retry_attempt >= max_retries:
-                    # 如果是最后一次重试，将所有剩余文件标记为失败
-                    for args in args_list:
-                        gpu_files, gpu_id = args[0], args[1]
-                        for input_file, output_file in gpu_files:
-                            all_results.append((False, f"进程池异常，无法处理: {input_file}"))
+                ret = p.wait(timeout=remaining)
+                logger.info(f"GPU {gpu_id} 进程已完成 (exit={ret}), log={log_file}")
+            except subprocess.TimeoutExpired:
+                logger.error(f"GPU {gpu_id} 进程超时 ({timeout_minutes}m)，强制终止")
+                p.kill()
+                p.wait()
             
-            # 如果没有失败的GPU批次，跳出重试循环
-            if not failed_gpu_files:
-                break
-            
-            # 重试前清理GPU内存
-            if retry_attempt < max_retries:
-                logger.info(f"重试前清理系统资源...")
-                try:
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                    time.sleep(5)  # 等待5秒让系统稳定
-                except:
-                    pass
-        
-        # 更新统计信息
-        self.stats.update_from_results(all_results)
+            # 读取结果
+            try:
+                with open(result_file, 'rb') as f:
+                    batch = pickle.load(f)
+                all_results.extend(batch)
+                logger.info(f"  GPU {gpu_id}: 读取到 {len(batch)} 条结果")
+            except Exception as e:
+                logger.error(f"  GPU {gpu_id}: 无法读取结果文件: {e}")
+            finally:
+                for fpath in [args_file, result_file, child_script_file]:
+                    try:
+                        os.unlink(fpath)
+                    except:
+                        pass
         
         logger.info(f"隔离GPU处理完成，总结果: {len(all_results)} 个")
         return all_results
