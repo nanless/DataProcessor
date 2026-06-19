@@ -76,8 +76,8 @@ class MossFormerGANConfig:
     """MossFormerGAN配置类"""
     
     # 路径配置
-    input_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/aidatatang_200zh"
-    output_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/aidatatang_200zh_mossformergan_enhanced"
+    input_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/SMIIP-TV"
+    output_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/SMIIP-TV_mossformergan_processed"
     
     # 模型配置
     model_name: str = "MossFormerGAN_SE_16K"
@@ -85,7 +85,7 @@ class MossFormerGANConfig:
     
     # 硬件配置
     device: str = "cuda"
-    gpu_ids: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6, 7])
+    gpu_ids: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
     
     # 音频配置
     target_sr: int = 16000  # 模型的采样率（输出音频将以此采样率保存）
@@ -115,7 +115,7 @@ class MossFormerGANConfig:
     # 异步处理管道配置
     enable_async_pipeline: bool = True  # 启用异步处理管道
     pipeline_queue_size: int = 8  # 管道队列大小（预处理缓冲区）
-    max_workers_per_gpu: int = 3  # 每个GPU的工作线程数
+    max_workers_per_gpu: int = 1  # 每个GPU的工作线程数（ClearVoice非线程安全，必须为1）
     gpu_timeout_seconds: int = 1800  # GPU处理超时时间（秒）
     
     # 动态负载均衡参数
