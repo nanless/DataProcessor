@@ -76,8 +76,8 @@ class MossFormerGANConfig:
     """MossFormerGAN配置类"""
     
     # 路径配置
-    input_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/SMIIP-TV"
-    output_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/SMIIP-TV_mossformergan_processed"
+    input_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/cnceleb"
+    output_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/cnceleb_mossformergan_enhanced"
     
     # 模型配置
     model_name: str = "MossFormerGAN_SE_16K"
