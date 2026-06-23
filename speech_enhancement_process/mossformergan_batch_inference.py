@@ -71,6 +71,102 @@ except ImportError as e:
     CLEARVOICE_AVAILABLE = False
 
 
+def patch_clearvoice_mossformergan_decoder():
+    """修复 ClearVoice MossFormerGAN 长音频分段解码尾段未处理导致静音的问题。"""
+    try:
+        import clearvoice.utils.decode as cv_decode
+
+        if getattr(cv_decode, "_dataprocessor_mossgan_patch_applied", False):
+            return
+
+        decode_one_segment = cv_decode._decode_one_audio_mossformergan_se_16k
+
+        def fixed_decode_one_audio_mossformergan_se_16k(model, device, inputs, args):
+            window = int(args.sampling_rate * args.decode_window)
+            stride = int(window * 0.75)
+            original_len = inputs.shape[1]
+            do_segment = original_len > args.sampling_rate * args.one_time_decode_length
+
+            inputs = torch.from_numpy(np.float32(inputs)).to(device)
+            norm_factor = torch.sqrt(inputs.size(-1) / torch.sum((inputs ** 2.0), dim=-1))
+
+            if not do_segment:
+                return decode_one_segment(model, device, inputs, norm_factor, args)
+
+            _, current_len = inputs.shape
+            if current_len < window:
+                padding = window - current_len
+            elif current_len < window + stride:
+                padding = window + stride - current_len
+            else:
+                remainder = (current_len - window) % stride
+                padding = 0 if remainder == 0 else stride - remainder
+
+            if padding > 0:
+                pad = torch.zeros(
+                    (inputs.shape[0], padding),
+                    dtype=inputs.dtype,
+                    device=inputs.device,
+                )
+                inputs = torch.cat([inputs, pad], dim=1)
+
+            padded_len = inputs.shape[1]
+            outputs = np.zeros(padded_len, dtype=np.float32)
+            give_up_length = (window - stride) // 2
+            current_idx = 0
+
+            while current_idx + window <= padded_len:
+                tmp_input = inputs[:, current_idx:current_idx + window]
+                tmp_output = decode_one_segment(model, device, tmp_input, norm_factor, args)
+                is_last = current_idx + stride + window > padded_len
+
+                if current_idx == 0:
+                    out_start = 0
+                    tmp_start = 0
+                else:
+                    out_start = current_idx + give_up_length
+                    tmp_start = give_up_length
+
+                if is_last:
+                    out_end = current_idx + window
+                    tmp_end = window
+                else:
+                    out_end = current_idx + window - give_up_length
+                    tmp_end = window - give_up_length
+
+                outputs[out_start:out_end] = tmp_output[tmp_start:tmp_end]
+                current_idx += stride
+
+            return outputs[:original_len]
+
+        cv_decode.decode_one_audio_mossformergan_se_16k = fixed_decode_one_audio_mossformergan_se_16k
+        cv_decode._dataprocessor_mossgan_patch_applied = True
+        logger.info("已应用 ClearVoice MossFormerGAN 分段解码尾段修复")
+    except Exception as e:
+        logger.warning(f"应用 ClearVoice MossFormerGAN 分段解码修复失败: {e}")
+
+
+def configure_clearvoice_mossformergan(clearvoice_instance, config):
+    """设置 ClearVoice MossFormerGAN 分段参数。"""
+    if getattr(config, "model_name", None) != "MossFormerGAN_SE_16K":
+        return
+
+    decode_window = getattr(config, "mossgan_decode_window_seconds", 20.0)
+    one_time_decode_length = getattr(config, "mossgan_one_time_decode_length_seconds", 20.0)
+
+    for model in getattr(clearvoice_instance, "models", []):
+        if getattr(model, "name", None) != "MossFormerGAN_SE_16K":
+            continue
+        if hasattr(model, "args"):
+            model.args.decode_window = decode_window
+            model.args.one_time_decode_length = one_time_decode_length
+            logger.info(
+                "MossFormerGAN 分段参数: decode_window=%.1fs, one_time_decode_length=%.1fs",
+                decode_window,
+                one_time_decode_length,
+            )
+
+
 @dataclass
 class MossFormerGANConfig:
     """MossFormerGAN配置类"""
@@ -78,10 +174,13 @@ class MossFormerGANConfig:
     # 路径配置
     input_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/cnceleb"
     output_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/cnceleb_mossformergan_enhanced"
+    log_prefix: str = "cnceleb_mossformergan"  # log/{log_prefix}_gpu{N}.log，避免多任务重名
     
     # 模型配置
     model_name: str = "MossFormerGAN_SE_16K"
     task: str = 'speech_enhancement'
+    mossgan_decode_window_seconds: float = 20.0  # MossFormerGAN 分段窗口长度
+    mossgan_one_time_decode_length_seconds: float = 20.0  # 超过该时长启用分段
     
     # 硬件配置
     device: str = "cuda"
@@ -89,7 +188,8 @@ class MossFormerGANConfig:
     
     # 音频配置
     target_sr: int = 16000  # 模型的采样率（输出音频将以此采样率保存）
-    skip_existing: bool = True  # 跳过已存在的文件
+    skip_existing: bool = False  # 覆盖已存在的文件
+    output_duration_tolerance: float = 0.02  # 输出时长允许误差比例，超过则重新处理
     
     # FFT下采样配置
     use_fft_downsample: bool = True  # 是否使用FFT下采样
@@ -268,8 +368,8 @@ class AudioProcessor:
                 elif audio_data.shape[1] == 1:
                     audio_data = audio_data.squeeze(1)  # (N, 1) -> (N,)
                 else:
-                    # 多通道，取第一个通道
-                    audio_data = audio_data[0]
+                    # 多通道，按常见音频布局取第一个通道: (N, C) 或 (C, N)
+                    audio_data = audio_data[:, 0] if audio_data.shape[0] > audio_data.shape[1] else audio_data[0]
                 print(f"调试信息 - 2D数组转换为1D，新形状: {audio_data.shape}")
             elif audio_data.ndim > 2:
                 # 更高维度的数组，尽力转换为1D
@@ -278,15 +378,65 @@ class AudioProcessor:
             
             print(f"调试信息 - 最终保存的音频形状: {audio_data.shape}, 数据类型: {audio_data.dtype}")
             
-            # 保存音频
-            sf.write(file_path, audio_data, sample_rate, format='WAV', subtype='PCM_16')
-            
+            # 先写同目录临时文件，再原子替换，避免进程中断留下半截输出
+            temp_output_path = f"{file_path}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+            try:
+                sf.write(temp_output_path, audio_data, sample_rate, format='WAV', subtype='PCM_16')
+                os.replace(temp_output_path, file_path)
+            finally:
+                if os.path.exists(temp_output_path):
+                    try:
+                        os.remove(temp_output_path)
+                    except:
+                        pass
+
             # 验证文件是否成功保存
             if not os.path.exists(file_path):
                 raise RuntimeError("文件保存后不存在")
                 
         except Exception as e:
             raise RuntimeError(f"保存音频文件失败 {file_path}: {e}")
+
+    @staticmethod
+    def get_audio_duration_seconds(file_path: str) -> float:
+        """读取音频时长，优先使用 soundfile，必要时回退到 pydub。"""
+        try:
+            info = sf.info(file_path)
+            return info.frames / info.samplerate
+        except Exception:
+            try:
+                from pydub import AudioSegment
+                return len(AudioSegment.from_file(file_path)) / 1000.0
+            except Exception as e:
+                raise RuntimeError(f"无法读取音频时长 {file_path}: {e}")
+
+    @staticmethod
+    def validate_enhanced_output(input_file: str, output_file: str, config: 'MossFormerGANConfig') -> Tuple[bool, str]:
+        """校验增强结果是否完整，防止短音频被当作成功结果跳过。"""
+        if not os.path.exists(output_file):
+            return False, "输出文件不存在"
+
+        try:
+            input_duration = AudioProcessor.get_audio_duration_seconds(input_file)
+            output_info = sf.info(output_file)
+            output_duration = output_info.frames / output_info.samplerate
+
+            if output_info.frames <= 0:
+                return False, "输出音频为空"
+            if output_info.samplerate != config.target_sr:
+                return False, f"输出采样率异常: {output_info.samplerate}Hz != {config.target_sr}Hz"
+            if output_info.channels != 1:
+                return False, f"输出通道数异常: {output_info.channels}ch != 1ch"
+
+            tolerance = getattr(config, 'output_duration_tolerance', 0.02)
+            if input_duration > 0:
+                ratio = output_duration / input_duration
+                if abs(1.0 - ratio) > tolerance:
+                    return False, f"输出时长异常: {output_duration:.3f}s vs 输入 {input_duration:.3f}s (ratio={ratio:.3f})"
+
+            return True, "输出校验通过"
+        except Exception as e:
+            return False, f"输出校验失败: {e}"
     
     @staticmethod
     def _needs_sanitization(file_path: str) -> bool:
@@ -582,6 +732,7 @@ def process_with_async_pipeline(file_list, gpu_id, model_name, task, target_sr, 
     # 在进程中导入ClearVoice并初始化模型
     try:
         from clearvoice import ClearVoice
+        patch_clearvoice_mossformergan_decoder()
         
         torch.cuda.set_device(0)
         
@@ -591,6 +742,7 @@ def process_with_async_pipeline(file_list, gpu_id, model_name, task, target_sr, 
         _cvn.SpeechModel.get_free_gpu = lambda self: 0 if torch.cuda.is_available() else None
         
         clearvoice_instance = ClearVoice(task=task, model_names=[model_name])
+        configure_clearvoice_mossformergan(clearvoice_instance, config)
         
         print(f"GPU {gpu_id} 模型加载成功，开始异步处理 {len(file_list)} 个文件")
         
@@ -812,6 +964,11 @@ def process_with_async_pipeline(file_list, gpu_id, model_name, task, target_sr, 
                                 # 保存音频
                                 model_sr = 16000
                                 AudioProcessor.save_audio(audio_data, output_file, model_sr)
+
+                                is_valid, validation_msg = AudioProcessor.validate_enhanced_output(input_file, output_file, config)
+                                if not is_valid:
+                                    results_queue.put((False, f"输出校验失败 {input_file}: {validation_msg}"))
+                                    continue
                                 
                                 total_time = preprocess_time + gpu_time
                                 speed_ratio = audio_duration_minutes * 60 / total_time if total_time > 0 else 0
@@ -958,11 +1115,13 @@ def process_batch_on_gpu_worker(args) -> List[Tuple[bool, str, Optional[np.ndarr
     # 在工作进程中初始化ClearVoice
     try:
         from clearvoice import ClearVoice
+        patch_clearvoice_mossformergan_decoder()
         
         # 强制使用设备0（在CUDA_VISIBLE_DEVICES隔离环境中）
         torch.cuda.set_device(0)
         
         clearvoice_instance = ClearVoice(task=task, model_names=[model_name])
+        configure_clearvoice_mossformergan(clearvoice_instance, config)
         
         logger.info(f"进程GPU {gpu_id} 开始处理 {len(batch_files)} 个文件")
         
@@ -1154,6 +1313,8 @@ class MossFormerGANBatchProcessor:
             raise ImportError("ClearVoice未安装，无法使用MossFormerGAN")
         
         try:
+            patch_clearvoice_mossformergan_decoder()
+
             if self.config.use_multi_gpu and len(self.available_gpus) > 1:
                 # 多GPU模式：为每个GPU创建一个ClearVoice实例
                 logger.info(f"初始化多GPU模式，使用GPU: {self.available_gpus}")
@@ -1166,6 +1327,7 @@ class MossFormerGANBatchProcessor:
                         task=self.config.task, 
                         model_names=[self.config.model_name]
                     )
+                    configure_clearvoice_mossformergan(clearvoice_instance, self.config)
                     
                     # 存储实例和对应的GPU ID
                     self.clearvoice_instances.append((clearvoice_instance, gpu_id))
@@ -1179,6 +1341,7 @@ class MossFormerGANBatchProcessor:
                     task=self.config.task, 
                     model_names=[self.config.model_name]
                 )
+                configure_clearvoice_mossformergan(clearvoice_instance, self.config)
                 self.clearvoice_instances.append(
                     (clearvoice_instance, self.available_gpus[0] if self.available_gpus else None)
                 )
@@ -1329,10 +1492,11 @@ class MossFormerGANBatchProcessor:
                     AudioProcessor.save_audio(audio_data, output_file, model_sr)
                     
                     # 检查结果
-                    if os.path.exists(output_file):
+                    is_valid, validation_msg = AudioProcessor.validate_enhanced_output(input_file, output_file, self.config)
+                    if is_valid:
                         return True, f"成功处理: {input_file}"
                     else:
-                        return False, f"处理失败，输出文件未生成: {input_file}"
+                        return False, f"处理失败，输出校验未通过 {input_file}: {validation_msg}"
                         
                 except Exception as e:
                     return False, f"保存失败 {input_file}: {e}"
@@ -1391,9 +1555,14 @@ class MossFormerGANBatchProcessor:
                     file_pair = (input_path, output_path)
                     all_files.append(file_pair)
                     
-                    # 检查输出文件是否已存在，决定是否跳过
+                    # 检查输出文件是否已存在且完整，坏文件必须重新处理
                     if self.config.skip_existing and os.path.exists(output_path):
-                        files_to_skip.append(file_pair)
+                        is_valid, reason = AudioProcessor.validate_enhanced_output(input_path, output_path, self.config)
+                        if is_valid:
+                            files_to_skip.append(file_pair)
+                        else:
+                            logger.warning(f"已存在输出无效，将重新处理: {output_path} ({reason})")
+                            files_to_process.append(file_pair)
                     else:
                         files_to_process.append(file_pair)
         
@@ -1549,12 +1718,14 @@ class MossFormerGANBatchProcessor:
             gpu_files = args[0]
             
             # 保存参数到临时文件
-            args_file = tempfile.mkstemp(suffix='.pkl', prefix=f'moss_args_gpu{gpu_id}_')[1]
+            args_file = tempfile.mkstemp(suffix='.pkl', prefix=f'{self.config.log_prefix}_args_gpu{gpu_id}_')[1]
             with open(args_file, 'wb') as f:
                 pickle.dump(args, f)
             
-            result_file = tempfile.mkstemp(suffix='.pkl', prefix=f'moss_result_gpu{gpu_id}_')[1]
-            log_file = f"/tmp/mossformergan_gpu{gpu_id}.log"
+            result_file = tempfile.mkstemp(suffix='.pkl', prefix=f'{self.config.log_prefix}_result_gpu{gpu_id}_')[1]
+            log_dir = os.path.join(os.getcwd(), "log")
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f"{self.config.log_prefix}_gpu{gpu_id}.log")
             
             # 将子进程代码写入临时脚本文件
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1585,7 +1756,7 @@ with open("{result_file}", 'wb') as f:
 
 log_f.close()
 '''
-            child_script_file = tempfile.mkstemp(suffix='.py', prefix=f'moss_worker_gpu{gpu_id}_')[1]
+            child_script_file = tempfile.mkstemp(suffix='.py', prefix=f'{self.config.log_prefix}_worker_gpu{gpu_id}_')[1]
             with open(child_script_file, 'w') as f:
                 f.write(child_script)
             
@@ -2041,7 +2212,21 @@ class SystemDiagnostics:
 
 def create_default_config() -> MossFormerGANConfig:
     """创建默认配置"""
-    return MossFormerGANConfig()
+    env_overrides = {
+        "input_dir": os.getenv("DP_MOSS_INPUT_DIR"),
+        "output_dir": os.getenv("DP_MOSS_OUTPUT_DIR"),
+        "log_prefix": os.getenv("DP_MOSS_LOG_PREFIX"),
+    }
+    kwargs = {key: value for key, value in env_overrides.items() if value}
+
+    if os.getenv("DP_MOSS_DECODE_WINDOW_SECONDS"):
+        kwargs["mossgan_decode_window_seconds"] = float(os.getenv("DP_MOSS_DECODE_WINDOW_SECONDS"))
+    if os.getenv("DP_MOSS_ONE_TIME_DECODE_LENGTH_SECONDS"):
+        kwargs["mossgan_one_time_decode_length_seconds"] = float(
+            os.getenv("DP_MOSS_ONE_TIME_DECODE_LENGTH_SECONDS")
+        )
+
+    return MossFormerGANConfig(**kwargs)
 
 
 def display_file_processing_status(files_to_process: List[Tuple[str, str]], 
@@ -2180,6 +2365,8 @@ def main():
         print(f"输出目录: {config.output_dir}")
         print(f"模型: {config.model_name}")
         print(f"任务: {config.task}")
+        print(f"MossFormerGAN分段窗口: {config.mossgan_decode_window_seconds}s")
+        print(f"MossFormerGAN分段阈值: {config.mossgan_one_time_decode_length_seconds}s")
         print(f"使用设备: {config.device}")
         print(f"可用GPU: {processor.available_gpus if processor.available_gpus else 'CPU'}")
         print(f"多GPU模式: {'启用' if config.use_multi_gpu else '禁用'}")
