@@ -175,6 +175,7 @@ class MossFormerGANConfig:
     input_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/cnceleb"
     output_dir: str = "/root/group-shared/voiceprint/data/speech/speaker_verification/cnceleb_mossformergan_enhanced"
     log_prefix: str = "cnceleb_mossformergan"  # log/{log_prefix}_gpu{N}.log，避免多任务重名
+    exclude_dir_names: List[str] = field(default_factory=list)  # 排除的目录名列表，如 full_recordings
     
     # 模型配置
     model_name: str = "MossFormerGAN_SE_16K"
@@ -184,7 +185,7 @@ class MossFormerGANConfig:
     
     # 硬件配置
     device: str = "cuda"
-    gpu_ids: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
+    gpu_ids: List[int] = field(default_factory=lambda: [1, 2, 3])
     
     # 音频配置
     target_sr: int = 16000  # 模型的采样率（输出音频将以此采样率保存）
@@ -1535,7 +1536,12 @@ class MossFormerGANBatchProcessor:
         files_to_process = []
         files_to_skip = []
         
+        exclude_dirs = set(getattr(self.config, 'exclude_dir_names', []) or [])
         for root, dirs, files in os.walk(self.config.input_dir):
+            if exclude_dirs:
+                root_parts = set(root.split(os.sep))
+                if root_parts & exclude_dirs:
+                    continue
             for file in files:
                 if file.lower().endswith(AudioProcessor.SUPPORTED_FORMATS):
                     input_path = os.path.join(root, file)
@@ -2225,6 +2231,8 @@ def create_default_config() -> MossFormerGANConfig:
         kwargs["mossgan_one_time_decode_length_seconds"] = float(
             os.getenv("DP_MOSS_ONE_TIME_DECODE_LENGTH_SECONDS")
         )
+    if os.getenv("DP_MOSS_EXCLUDE_DIRS"):
+        kwargs["exclude_dir_names"] = [d.strip() for d in os.getenv("DP_MOSS_EXCLUDE_DIRS").split(",") if d.strip()]
 
     return MossFormerGANConfig(**kwargs)
 
