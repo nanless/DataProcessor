@@ -185,7 +185,7 @@ class MossFormerGANConfig:
     
     # 硬件配置
     device: str = "cuda"
-    gpu_ids: List[int] = field(default_factory=lambda: [1, 2, 3])
+    gpu_ids: List[int] = field(default_factory=lambda: [0, 1, 2, 3])
     
     # 音频配置
     target_sr: int = 16000  # 模型的采样率（输出音频将以此采样率保存）
@@ -210,14 +210,14 @@ class MossFormerGANConfig:
     max_audio_duration_minutes: float = 120.0  # 单文件最大时长限制(分钟)
     enable_process_recovery: bool = True  # 启用进程崩溃恢复
     max_retry_attempts: int = 2  # 最大重试次数
-    process_timeout_minutes: int = 600  # 单个进程超时时间(分钟)
+    process_timeout_minutes: int = 600  # [已弃用] 看门狗已移除，不再强杀进程
     skip_large_files: bool = True  # 跳过超大文件
     
     # 异步处理管道配置
     enable_async_pipeline: bool = True  # 启用异步处理管道
     pipeline_queue_size: int = 8  # 管道队列大小（预处理缓冲区）
     max_workers_per_gpu: int = 1  # 每个GPU的工作线程数（ClearVoice非线程安全，必须为1）
-    gpu_timeout_seconds: int = 1800  # GPU处理超时时间（秒）
+    gpu_timeout_seconds: int = 1800  # [已弃用] 看门狗已移除，结果收集改为阻塞等待
     
     # 动态负载均衡参数
     enable_dynamic_balancing: bool = False  # 禁用动态负载均衡（大规模文件时复杂度计算开销过大）
@@ -1019,7 +1019,7 @@ def process_with_async_pipeline(file_list, gpu_id, model_name, task, target_sr, 
     print(f"  🎯 GPU处理线程: AI模型推理 + 结果保存")
     print(f"  📊 管道队列大小: {queue_size} (缓冲区)")
     print(f"  🧵 GPU工作线程数: {getattr(config, 'max_workers_per_gpu', 2)}")
-    print(f"  ⏱️ GPU处理超时: {getattr(config, 'gpu_timeout_seconds', 1200)}秒")
+    print(f"  ⏱️ GPU处理超时: 已禁用（阻塞等待，不强杀）")
     
     # 创建预处理线程
     preprocess_thread = threading.Thread(target=preprocessing_worker, daemon=True, name=f"GPU{gpu_id}-Preprocess")
@@ -1044,27 +1044,28 @@ def process_with_async_pipeline(file_list, gpu_id, model_name, task, target_sr, 
     # 创建进度条
     pbar = tqdm(total=len(file_list), desc=f"GPU {gpu_id}", position=position, leave=True)
     
-        # 收集结果
+    # 收集结果 — 阻塞等待，不设超时、不中途放弃健康线程；
+    # 仅当所有工作线程都已退出且队列排空时才停止，避免在线程崩溃时永久挂起
     completed = 0
     while completed < len(file_list):
         try:
-            # 使用配置的超时时间
-            timeout_seconds = getattr(config, 'gpu_timeout_seconds', 1200)
-            result = results_queue.get(timeout=timeout_seconds)
-            results.append(result)
-            completed += 1
-            pbar.update(1)
-            
-            # 更新进度条状态
-            if result[0]:
-                pbar.set_postfix({"状态": "成功"})
-            else:
-                pbar.set_postfix({"状态": "失败"})
-                
+            result = results_queue.get(timeout=1.0)
         except queue.Empty:
-            timeout_minutes = getattr(config, 'gpu_timeout_seconds', 1200) // 60
-            print(f"⚠️ GPU {gpu_id}: 结果收集超时 ({timeout_minutes}分钟)")
-            break
+            workers_alive = any(t.is_alive() for t in gpu_threads) or preprocess_thread.is_alive()
+            if not workers_alive and results_queue.empty():
+                print(f"⚠️ GPU {gpu_id}: 工作线程已全部退出，停止收集 (已完成 {completed}/{len(file_list)})")
+                break
+            continue
+
+        results.append(result)
+        completed += 1
+        pbar.update(1)
+
+        # 更新进度条状态
+        if result[0]:
+            pbar.set_postfix({"状态": "成功"})
+        else:
+            pbar.set_postfix({"状态": "失败"})
     
     # 等待线程完成
     thread_timeout = getattr(config, 'thread_join_timeout_seconds', 10)
@@ -1783,18 +1784,10 @@ log_f.close()
             processes.append((gpu_id, p, args_file, result_file, log_file, child_script_file))
             time.sleep(5)
         
-        # 收集结果 — 每个 GPU 重置超时，不累计
-        timeout_minutes = getattr(self.config, 'process_timeout_minutes', 30)
-        
+        # 收集结果 — 阻塞等待每个 GPU 进程自然结束，不设超时、不强杀
         for gpu_id, p, args_file, result_file, log_file, child_script_file in processes:
-            remaining = timeout_minutes * 60
-            try:
-                ret = p.wait(timeout=remaining)
-                logger.info(f"GPU {gpu_id} 进程已完成 (exit={ret}), log={log_file}")
-            except subprocess.TimeoutExpired:
-                logger.error(f"GPU {gpu_id} 进程超时 ({timeout_minutes}m)，强制终止")
-                p.kill()
-                p.wait()
+            ret = p.wait()
+            logger.info(f"GPU {gpu_id} 进程已完成 (exit={ret}), log={log_file}")
             
             # 读取结果
             try:
@@ -2205,14 +2198,10 @@ class SystemDiagnostics:
             print(f"  - 自动跳过超大文件(>{config.max_file_size_mb}MB或>{config.max_audio_duration_minutes}分钟)")
             print("  - GPU内存实时监控，不足时自动清理")
             print(f"  - 进程崩溃自动重试(最多{config.max_retry_attempts}次)")
-            print(f"  - 进程超时保护({config.process_timeout_minutes}分钟)")
-            print(f"  - 单文件处理超时保护({config.gpu_timeout_seconds//60}分钟)")
         else:
             print("  - 自动跳过超大文件")
             print("  - GPU内存实时监控，不足时自动清理")
             print("  - 进程崩溃自动重试")
-            print("  - 进程超时保护")
-            print("  - 单文件处理超时保护")
         print("=" * 60)
 
 
@@ -2323,7 +2312,6 @@ def display_file_processing_status(files_to_process: List[Tuple[str, str]],
         print(f"   ✓ 自动跳过超大文件 (>{config.max_file_size_mb}MB或>{config.max_audio_duration_minutes}分钟)")
         print(f"   ✓ GPU内存实时监控和自动清理")
         print(f"   ✓ 进程崩溃自动重试 (最多2次)")
-        print(f"   ✓ 进程/文件处理超时保护")
         print(f"   ✓ 详细错误分类和处理建议")
     
     print("=" * 80)
@@ -2385,11 +2373,10 @@ def main():
         print(f"异步处理管道: {'启用' if config.enable_async_pipeline else '禁用'}")
         print(f"管道队列大小: {config.pipeline_queue_size} (预处理缓冲)")
         print(f"每GPU工作线程: {config.max_workers_per_gpu}")
-        print(f"GPU处理超时: {config.gpu_timeout_seconds}秒")
         print(f"FFT下采样: {'启用' if config.use_fft_downsample else '禁用'}")
         print(f"🛡️ 大文件保护: 单文件限制 {config.max_file_size_mb}MB / {config.max_audio_duration_minutes}分钟")
         print(f"🔄 进程恢复: {'启用' if config.enable_process_recovery else '禁用'} (最多重试{config.max_retry_attempts}次)")
-        print(f"⏱️ 进程超时: {config.process_timeout_minutes}分钟")
+        print(f"⏱️ 进程/GPU超时: 已禁用（阻塞等待，不强杀）")
         
         # 根据GPU显存给出配置建议
         if torch.cuda.is_available():

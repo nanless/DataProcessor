@@ -87,27 +87,34 @@ run_dataset_if_reached() {
   fi
 }
 
-run_dataset_if_reached \
-  "SMIIP-TV" \
-  "/root/group-shared/voiceprint/data/speech/speaker_verification/SMIIP-TV" \
-  "/root/group-shared/voiceprint/data/speech/speaker_verification/SMIIP-TV_mossformergan_processed" \
-  "smiip_mossformergan_20s"
+# run_dataset_if_reached \
+#   "SMIIP-TV" \
+#   "/root/group-shared/voiceprint/data/speech/speaker_verification/SMIIP-TV" \
+#   "/root/group-shared/voiceprint/data/speech/speaker_verification/SMIIP-TV_mossformergan_processed" \
+#   "smiip_mossformergan_20s"
+
+# run_dataset_if_reached \
+#   "seniortalk_processed" \
+#   "/root/group-shared/voiceprint/data/speech/speaker_verification/seniortalk_processed" \
+#   "/root/group-shared/voiceprint/data/speech/speaker_verification/seniortalk_processed_singletalk_mossformergan_processed" \
+#   "seniortalk_processed_mossformergan_20s" \
+#   "DP_MOSS_EXCLUDE_DIRS=full_recordings"
+
+# run_dataset_if_reached \
+#   "aidatatang_200zh" \
+#   "/root/group-shared/voiceprint/data/speech/speaker_verification/aidatatang_200zh" \
+#   "/root/group-shared/voiceprint/data/speech/speaker_verification/aidatatang_200zh_mossformergan_enhanced" \
+#   "aidatatang_200zh_mossformergan_20s"
+
+# run_dataset_if_reached \
+#   "cnceleb" \
+#   "/root/group-shared/voiceprint/data/speech/speaker_verification/cnceleb" \
+#   "/root/group-shared/voiceprint/data/speech/speaker_verification/cnceleb_mossformergan_enhanced" \
+#   "cnceleb_mossformergan_20s"
+
 
 run_dataset_if_reached \
-  "seniortalk_processed" \
-  "/root/group-shared/voiceprint/data/speech/speaker_verification/seniortalk_processed" \
-  "/root/group-shared/voiceprint/data/speech/speaker_verification/seniortalk_processed_singletalk_mossformergan_processed" \
-  "seniortalk_processed_mossformergan_20s" \
-  "DP_MOSS_EXCLUDE_DIRS=full_recordings"
-
-run_dataset_if_reached \
-  "aidatatang_200zh" \
-  "/root/group-shared/voiceprint/data/speech/speaker_verification/aidatatang_200zh" \
-  "/root/group-shared/voiceprint/data/speech/speaker_verification/aidatatang_200zh_mossformergan_enhanced" \
-  "aidatatang_200zh_mossformergan_20s"
-
-run_dataset_if_reached \
-  "cnceleb" \
-  "/root/group-shared/voiceprint/data/speech/speaker_verification/cnceleb" \
-  "/root/group-shared/voiceprint/data/speech/speaker_verification/cnceleb_mossformergan_enhanced" \
-  "cnceleb_mossformergan_20s"
+  "voxceleb" \
+  "/root/group-shared/voiceprint/data/speech/speaker_verification/voxceleb" \
+  "/root/group-shared/voiceprint/data/speech/speaker_verification/voxceleb_mossformergan_enhanced" \
+  "voxceleb_mossformergan_20s"
